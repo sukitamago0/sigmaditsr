@@ -130,6 +130,7 @@ def train():
     log_buffer = LogBuffer()
 
     global_step = start_step + 1
+    micro_step = start_step * config.gradient_accumulation_steps
 
     load_vae_feat = getattr(train_dataloader.dataset, 'load_vae_feat', False)
     load_t5_feat = getattr(train_dataloader.dataset, 'load_t5_feat', False)
@@ -174,14 +175,16 @@ def train():
             data_time_all += time.time() - data_time_start
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                optimizer.zero_grad()
+                if micro_step % config.gradient_accumulation_steps == 0:
+                    optimizer.zero_grad()
                 loss_term = train_diffusion.training_losses(model, clean_images, timesteps, model_kwargs=dict(y=y, mask=y_mask, data_info=data_info))
                 loss = loss_term['loss'].mean()
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
-                optimizer.step()
-                lr_scheduler.step()
+                    optimizer.step()
+                    lr_scheduler.step()
+            micro_step += 1
 
             lr = lr_scheduler.get_last_lr()[0]
             logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}

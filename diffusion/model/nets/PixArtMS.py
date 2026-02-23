@@ -68,11 +68,20 @@ class PixArtMSBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
 
-    def forward(self, x, y, t, mask=None, HW=None, **kwargs):
+    def forward(self, x, y, t, mask=None, HW=None, adaln_shift=None, adaln_scale=None, adaln_alpha=None, **kwargs):
         B, N, C = x.shape
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(self.norm1(x), shift_msa, scale_msa), HW=HW))
+
+        if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
+            with torch.cuda.amp.autocast(enabled=False):
+                h = self.norm1(x.float())
+                h = h * (1.0 + adaln_alpha.float() * adaln_scale.float()) + adaln_alpha.float() * adaln_shift.float()
+                h = h.to(x.dtype)
+        else:
+            h = self.norm1(x)
+
+        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
         x = x + self.cross_attn(x, y, mask)
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
 
