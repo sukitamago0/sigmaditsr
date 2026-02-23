@@ -11,6 +11,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 # ================= 1. Path Setup =================
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -21,7 +22,6 @@ import glob
 import random
 import math
 import numpy as np
-from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,12 +37,13 @@ import matplotlib.pyplot as plt
 
 import lpips
 from diffusers import AutoencoderKL, DDIMScheduler
+from transformers import T5Tokenizer, T5EncoderModel
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter_v7 import build_adapter_v7
+from diffusion.model.nets.adapter import build_adapter_v7
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
@@ -77,9 +78,11 @@ VAL_LR_DIR_CANDIDATES = [
 ]
 VAL_LR_DIR = next((p for p in VAL_LR_DIR_CANDIDATES if os.path.exists(p)), None)
 
-PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-XL-2-512x512.pth")
-VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
-T5_EMBED_PATH = "/home/hello/HJT/DiTSR/output/null_embed.pth"
+PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-Sigma-XL-2-512-MS.pth")
+DIFFUSERS_ROOT = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "pixart_sigma_sdxlvae_T5_diffusers")
+TOKENIZER_PATH = os.path.join(DIFFUSERS_ROOT, "tokenizer")
+TEXT_ENCODER_PATH = os.path.join(DIFFUSERS_ROOT, "text_encoder")
+VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred")
@@ -985,6 +988,11 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
 # ================= 10. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
+    required_paths = [PIXART_PATH, TOKENIZER_PATH, TEXT_ENCODER_PATH, VAE_PATH]
+    for pth in required_paths:
+        if not os.path.exists(pth):
+            raise FileNotFoundError(f"Required pretrained path missing: {pth}")
+
     train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
     if VAL_MODE == "valpack":
         val_ds = ValPackDataset(VAL_PACK_DIR, lr_dir_name=VAL_PACK_LR_DIR_NAME, crop_size=512)
@@ -1028,7 +1036,14 @@ def main():
     for p in vae.parameters(): p.requires_grad_(False)
     for p in lpips_fn.parameters(): p.requires_grad_(False)
 
-    y = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(DEVICE)
+    tokenizer = T5Tokenizer.from_pretrained(TOKENIZER_PATH, local_files_only=True)
+    text_encoder = T5EncoderModel.from_pretrained(TEXT_ENCODER_PATH, local_files_only=True).to(DEVICE).eval()
+    for p in text_encoder.parameters():
+        p.requires_grad_(False)
+    with torch.no_grad():
+        null_tokens = tokenizer("", max_length=120, padding="max_length", truncation=True, return_tensors="pt").to(DEVICE)
+        y = text_encoder(null_tokens.input_ids, attention_mask=null_tokens.attention_mask)[0].unsqueeze(1)
+
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
     # [FIXED HERE] Process-Corrected Optimizer Grouping (Mutually Exclusive)
