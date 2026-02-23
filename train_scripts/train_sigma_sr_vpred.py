@@ -107,7 +107,7 @@ NUM_WORKERS = 8
 LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
-TRAIN_PIXART_X_EMBEDDER = False  # keep False for "LoRA + injection modules only" training
+TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_embedder
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
 INJECTION_STRATEGY = "full"
@@ -1130,7 +1130,7 @@ def main():
         {"params": lora_params, "lr": 1e-5},
     ]
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-4})
+        optim_groups.append({"params": embedder_params, "lr": 5e-5})
     optimizer = torch.optim.AdamW(optim_groups)
 
     # 2. Clipper needs flat tensor list
