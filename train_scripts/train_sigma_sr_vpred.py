@@ -52,7 +52,7 @@ BASE_PIXART_SHA256 = None
 # Added "aug_embedder" to required keys
 V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
     "input_adaln", "adapter_alpha_mlp", "input_res_gate",
-    "input_adapter_ln", "style_fusion_mlp", "post_inject_dwconv", "post_inject_beta"
+    "input_adapter_ln", "style_fusion_mlp", "post_inject_dwconv", "post_inject_beta", "aug_embedder"
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 
@@ -116,7 +116,7 @@ INJECTION_CUTOFF_LAYER = 28
 INJECTION_STRATEGY = "full"
 
 # [V8 Augmentation]
-COND_AUG_NOISE_RANGE = (0.0, 0.15) 
+COND_AUG_NOISE_RANGE = (0.0, 0.05) 
 
 WARMUP_STEPS = 4000         
 RAMP_UP_STEPS = 5000         
@@ -963,11 +963,16 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     lr_ref = z_lr.to(COMPUTE_DTYPE)
                     model_in = torch.cat([latents.to(COMPUTE_DTYPE), lr_ref], dim=1)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, injection_mode="hybrid", force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
-                    if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
-                    if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
-                    out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
+                    if CFG_SCALE == 1.0:
+                        out = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
+                        if out.shape[1] == 8:
+                            out, _ = out.chunk(2, dim=1)
+                    else:
+                        out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, injection_mode="hybrid", force_drop_ids=drop_uncond)
+                        out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
+                        if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
+                        if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
+                        out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
             pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
             p01 = (pred + 1) / 2; h01 = (hr + 1) / 2
@@ -1074,7 +1079,7 @@ def main():
 
     inject_gate_keys = (
         "adapter_alpha_mlp", "input_adaln", "input_res_gate",
-        "style_fusion_mlp", "input_adapter_ln", "post_inject_dwconv", "post_inject_beta"
+        "style_fusion_mlp", "input_adapter_ln", "post_inject_dwconv", "post_inject_beta", "aug_embedder"
     )
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
