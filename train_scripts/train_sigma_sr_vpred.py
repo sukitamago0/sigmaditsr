@@ -2,11 +2,10 @@
 # DiTSR v8 Training Script (Final Corrected Version)
 # ------------------------------------------------------------------
 # Fixes included:
-# 1. [FFL] Added @torch.cuda.amp.autocast(enabled=False) & .float() cast.
-# 2. [Optim] Fixed parameter grouping (Mutually Exclusive).
-# 3. [Process] Unlocked x_embedder learning rate (1e-4).
-# 4. [Process] Disabled LPIPS for structure convergence (Stage 1).
-# 5. [Structure] Fixed NameError by ensuring Dataset classes are defined.
+# 1. [Optim] Fixed parameter grouping (Mutually Exclusive).
+# 2. [Process] Unlocked x_embedder learning rate (1e-4).
+# 3. [Process] Disabled LPIPS for structure convergence (Stage 1).
+# 4. [Structure] Fixed NameError by ensuring Dataset classes are defined.
 # ------------------------------------------------------------------
 
 import os
@@ -123,8 +122,6 @@ RAMP_UP_STEPS = 5000
 TARGET_LPIPS_WEIGHT = 0.50
 LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 1.0
-# [New] Focal Frequency Loss Weight
-FFL_BASE_WEIGHT = 0.0  # disabled (replaced by GT-edge-guided losses)
 EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
 FLAT_HF_WEIGHT   = 0.05     # flat/defocus HF suppression (Laplacian)
 EDGE_Q           = 0.90     # GT edge quantile for normalization
@@ -365,39 +362,9 @@ def get_config_snapshot():
         "lora_rank": LORA_RANK,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "ffl_weight": FFL_BASE_WEIGHT,
         "loss_weights": "Dynamic",
         "seed": SEED,
     }
-
-# [New Class] Focal Frequency Loss (Placed BEFORE Main)
-class FocalFrequencyLoss(nn.Module):
-    def __init__(self, loss_weight=1.0, alpha=1.0):
-        super(FocalFrequencyLoss, self).__init__()
-        self.loss_weight = loss_weight
-        self.alpha = alpha
-
-    # [FIX] Enforce FP32 execution to avoid BFloat16 error in FFT
-    @torch.cuda.amp.autocast(enabled=False)
-    def forward(self, pred, target):
-        # Cast to float32 explicitly
-        pred = pred.float()
-        target = target.float()
-
-        # pred, target: [B, C, H, W]
-        # Calculate 2D FFT
-        pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
-        target_fft = torch.fft.fft2(target, dim=(-2, -1))
-        
-        # Stack real and imag parts
-        pred_fft = torch.stack([pred_fft.real, pred_fft.imag], -1)
-        target_fft = torch.stack([target_fft.real, target_fft.imag], -1)
-
-        # MSE in Frequency Domain
-        diff = pred_fft - target_fft
-        loss = torch.mean(diff ** 2) 
-
-        return loss * self.loss_weight
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -883,6 +850,33 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         except Exception as e: print(f"❌ Failed to save best checkpoint: {e}")
     return best_records
 
+def _strict_load_pixart_trainable_subset(pixart: nn.Module, saved_trainable: dict, context: str):
+    expected = {k for k, p in pixart.named_parameters() if p.requires_grad}
+    saved = set(saved_trainable.keys())
+    missing = sorted(expected - saved)
+    unexpected = sorted(saved - expected)
+    if missing or unexpected:
+        msg = [f"{context}: pixart_trainable key mismatch."]
+        if missing:
+            msg.append(f"missing({len(missing)}): {missing[:20]}")
+        if unexpected:
+            msg.append(f"unexpected({len(unexpected)}): {unexpected[:20]}")
+        raise RuntimeError(" ".join(msg))
+
+    curr = pixart.state_dict()
+    bad_shapes = []
+    for k in sorted(saved & expected):
+        ckpt_t = saved_trainable[k]
+        if tuple(ckpt_t.shape) != tuple(curr[k].shape):
+            bad_shapes.append((k, tuple(ckpt_t.shape), tuple(curr[k].shape)))
+    if bad_shapes:
+        preview = "; ".join([f"{k}: ckpt{a} vs model{b}" for k, a, b in bad_shapes[:20]])
+        raise RuntimeError(f"{context}: pixart_trainable shape mismatch count={len(bad_shapes)}. {preview}")
+
+    for k in sorted(expected):
+        curr[k] = saved_trainable[k].to(dtype=curr[k].dtype)
+    pixart.load_state_dict(curr, strict=False)
+
 def resume(pixart, adapter, optimizer, dl_gen):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
@@ -891,18 +885,14 @@ def resume(pixart, adapter, optimizer, dl_gen):
     required_frags = get_required_v7_key_fragments_for_model(pixart)
     missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
     if missing_required: raise RuntimeError("Checkpoint is missing required v7 trainable keys: " + ", ".join(missing_required))
+
     adapter_sd = ckpt.get("adapter", {})
-    missing, unexpected = adapter.load_state_dict(adapter_sd, strict=False)
-    if missing or unexpected: print(f"⚠️ Adapter state_dict mismatch: missing={len(missing)} unexpected={len(unexpected)}")
-    if "scale_gates" in adapter_sd:
-        saved = adapter_sd["scale_gates"]; current = adapter.scale_gates
-        if saved.shape != current.shape:
-            n = min(saved.shape[0], current.shape[0]); 
-            with torch.no_grad(): current[:n].copy_(saved[:n])
-    curr = pixart.state_dict()
-    for k, v in saved_trainable.items():
-        if k in curr: curr[k] = v.to(curr[k].dtype)
-    pixart.load_state_dict(curr, strict=False)
+    try:
+        adapter.load_state_dict(adapter_sd, strict=True)
+    except RuntimeError as e:
+        raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
+
+    _strict_load_pixart_trainable_subset(pixart, saved_trainable, context="resume")
     optimizer.load_state_dict(ckpt["optimizer"])
     rs = ckpt.get("rng_state", None)
     if rs is not None:
@@ -1103,15 +1093,13 @@ def main():
     # 2. Clipper needs flat tensor list
     params_to_clip = adapter_params + embedder_params + inject_gate_params + other_pixart_params
 
-    # [New] Initialize Focal Frequency Loss
-
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
     # We will manually calculate v_target and loss.
     # Note: IDDPM class is kept for schedule utils, but we bypass its loss function.
     diffusion = IDDPM(str(1000))
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
 
-    print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init, FFL).")
+    print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
 
     for epoch in range(ep_start, 1000):
@@ -1181,12 +1169,10 @@ def main():
 
                 w = get_loss_weights(step)
                 
-                # Calculate pixel-space losses (FFL and/or LPIPS)
-                # We decode if either LPIPS or FFL is active to save resources
+                # Calculate pixel-space losses
                 loss_edge = torch.tensor(0.0, device=DEVICE)
                 loss_flat_hf = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
-                loss_ffl = torch.tensor(0.0, device=DEVICE)
 
                 need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0)
                 allow_by_t = int(t[0].item()) <= PIXEL_LOSS_T_MAX
@@ -1215,9 +1201,6 @@ def main():
                             img_p_valid, img_t_valid, q=EDGE_Q, pow_=EDGE_POW
                         )
                     
-                    # [New] Compute FFL (with float32 cast fix)
-                    if FFL_BASE_WEIGHT > 0:
-                        loss_ffl = ffl_criterion(img_p_valid, img_t_valid)
 
                 inject_reg = compute_injection_scale_reg(pixart, INJECT_SCALE_REG_LAMBDA)
                 loss = (
@@ -1245,7 +1228,6 @@ def main():
                     'flat_hf': f"{loss_flat_hf.item():.3f}",
                     'w_edge': f"{w['edge_grad']:.3f}",
                     'w_flat': f"{w['flat_hf']:.3f}",
-                    'ffl': f"{loss_ffl.item():.4f}",
                     'ireg': f"{inject_reg.item():.4f}",
                 })
 
