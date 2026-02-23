@@ -36,7 +36,6 @@ import matplotlib.pyplot as plt
 
 import lpips
 from diffusers import AutoencoderKL, DDIMScheduler
-from transformers import T5Tokenizer, T5EncoderModel
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
@@ -79,8 +78,6 @@ VAL_LR_DIR = next((p for p in VAL_LR_DIR_CANDIDATES if os.path.exists(p)), None)
 
 PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-Sigma-XL-2-512-MS.pth")
 DIFFUSERS_ROOT = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "pixart_sigma_sdxlvae_T5_diffusers")
-TOKENIZER_PATH = os.path.join(DIFFUSERS_ROOT, "tokenizer")
-TEXT_ENCODER_PATH = os.path.join(DIFFUSERS_ROOT, "text_encoder")
 VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
 NULL_T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "null_t5_embed_sigma_300.pth")
 
@@ -144,11 +141,9 @@ USE_LQ_INIT = True
 LQ_INIT_STRENGTH = 0.1
 
 INIT_NOISE_STD = 0.0
-USE_CFG_TRAIN = False
-CFG_TRAIN_SCALE = 3.0
 USE_ADAPTER_CFDROPOUT = True
 COND_DROP_PROB = 0.10
-FORCE_DROP_TEXT = True
+FORCE_DROP_TEXT = True  # validation-time text drop behavior
 INJECT_SCALE_REG_LAMBDA = 1e-4
 PIXEL_LOSS_T_MAX = 250
 PIXEL_LOSS_START_STEP = WARMUP_STEPS
@@ -347,13 +342,13 @@ def log_injection_scale_stats(model: nn.Module, prefix: str = "[InjectScale]"):
         return
     vals = []
     for p in model.injection_scales:
-        vals.append(float(p.detach().float().mean().item()))
+        vals.append(float(F.softplus(p.detach().float()).mean().item()))
     if len(vals) == 0:
         return
     k = min(5, len(vals))
     front_mean = float(np.mean(vals[:k]))
     back_mean = float(np.mean(vals[-k:]))
-    print(f"{prefix} front{k}_mean={front_mean:.4f} back{k}_mean={back_mean:.4f} min={min(vals):.4f} max={max(vals):.4f}")
+    print(f"{prefix} front{k}_mean={front_mean:.4f} back{k}_mean={back_mean:.4f} min={min(vals):.4f} max={max(vals):.4f} (softplus)")
 
 def get_config_snapshot():
     return {
@@ -812,18 +807,10 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         worst_record = best_records[-1]
         if (priority < worst_record['priority']) or (priority == worst_record['priority'] and score < worst_record['score']): save_as_best = True
 
+    ckpt_name = None
     if save_as_best:
         ckpt_name = f"epoch{epoch+1:03d}_psnr{psnr_v:.2f}_lp{lpips_v:.4f}.pth"
         ckpt_path = os.path.join(CKPT_DIR, ckpt_name); current_record['path'] = ckpt_path
-        try:
-            best_records.append(current_record); best_records.sort(key=lambda x: (x['priority'], x['score']))
-            if len(best_records) > KEEP_TOPK:
-                to_delete = best_records[KEEP_TOPK:]; best_records = best_records[:KEEP_TOPK]
-                for rec in to_delete:
-                    if rec['path'] and os.path.exists(rec['path']):
-                        try: os.remove(rec['path']); print(f"🗑️ Removed old best: {os.path.basename(rec['path'])}")
-                        except: pass
-        except Exception as e: print(f"❌ Failed to save best checkpoint: {e}")
 
     if BASE_PIXART_SHA256 is None and os.path.exists(PIXART_PATH):
         try: BASE_PIXART_SHA256 = file_sha256(PIXART_PATH)
@@ -835,23 +822,51 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         raise RuntimeError("No LoRA keys found in pixart_trainable. Check apply_lora() and requires_grad flags.")
     print(f"✅ LoRA save check: {lora_key_count} tensors")
     print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
+
+    next_best_records = list(best_records)
+    if save_as_best:
+        next_best_records.append(current_record)
+        next_best_records.sort(key=lambda x: (x['priority'], x['score']))
+        next_best_records = next_best_records[:KEEP_TOPK]
+
     state = {
         "epoch": epoch, "step": global_step, "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
         "optimizer": optimizer.state_dict(),
         "rng_state": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "numpy": np.random.get_state(), "python": random.getstate()},
-        "dl_gen_state": dl_gen.get_state(), "pixart_trainable": pixart_sd, "best_records": best_records, "config_snapshot": get_config_snapshot(), "base_pixart_sha256": BASE_PIXART_SHA256, "env_info": {"torch": torch.__version__, "numpy": np.__version__},
+        "dl_gen_state": dl_gen.get_state(), "pixart_trainable": pixart_sd, "best_records": next_best_records, "config_snapshot": get_config_snapshot(), "base_pixart_sha256": BASE_PIXART_SHA256, "env_info": {"torch": torch.__version__, "numpy": np.__version__},
     }
     last_path = LAST_CKPT_PATH; ok_last, msg_last = atomic_torch_save(state, last_path)
     if ok_last: print(f"💾 Saved last checkpoint to {last_path} [{msg_last}]")
     else: print(f"❌ Failed to save last.pth: {msg_last}")
+
+    best_saved = False
     if save_as_best and current_record["path"]:
         try:
-            if ok_last and os.path.exists(last_path): shutil.copy2(last_path, current_record["path"]); print(f"🏆 New Best Model! Copied from last.pth to {ckpt_name}")
+            if ok_last and os.path.exists(last_path):
+                shutil.copy2(last_path, current_record["path"]); print(f"🏆 New Best Model! Copied from last.pth to {ckpt_name}")
+                best_saved = True
             else:
                 ok_best, msg_best = atomic_torch_save(state, current_record["path"])
-                if ok_best: print(f"🏆 New Best Model! Saved to {ckpt_name} [{msg_best}]")
-                else: print(f"❌ Failed to save best checkpoint: {msg_best}")
-        except Exception as e: print(f"❌ Failed to save best checkpoint: {e}")
+                if ok_best:
+                    print(f"🏆 New Best Model! Saved to {ckpt_name} [{msg_best}]")
+                    best_saved = True
+                else:
+                    print(f"❌ Failed to save best checkpoint: {msg_best}")
+        except Exception as e:
+            print(f"❌ Failed to save best checkpoint: {e}")
+
+    if best_saved:
+        old_paths = {rec.get('path') for rec in best_records if rec.get('path')}
+        keep_paths = {rec.get('path') for rec in next_best_records if rec.get('path')}
+        for stale in sorted(old_paths - keep_paths):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                    print(f"🗑️ Removed old best: {os.path.basename(stale)}")
+                except Exception:
+                    pass
+        return next_best_records
+
     return best_records
 
 def _strict_load_pixart_trainable_subset(pixart: nn.Module, saved_trainable: dict, context: str):
@@ -1097,6 +1112,16 @@ def main():
     # 2. Clipper needs flat tensor list
     params_to_clip = adapter_params + embedder_params + inject_gate_params + other_pixart_params
 
+    # Sanity checks: ensure pixart trainable params are fully and uniquely covered.
+    pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
+    grouped = embedder_params + inject_gate_params + other_pixart_params
+    if len({id(p) for p in grouped}) != len(grouped):
+        raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
+    if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
+        raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
+    if len(embedder_params) == 0 or len(inject_gate_params) == 0:
+        print(f"⚠️ Optimizer group warning: embedder={len(embedder_params)}, inject_gate={len(inject_gate_params)}")
+
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
     # We will manually calculate v_target and loss.
     # Note: IDDPM class is kept for schedule utils, but we bypass its loss function.
@@ -1110,8 +1135,12 @@ def main():
         if max_steps is not None and step >= max_steps: break
         train_ds.set_epoch(epoch)
         pbar = tqdm(train_loader, dynamic_ncols=True, desc=f"Ep{epoch+1}")
+        accum_micro_steps = 0
+        reached_max_steps = False
         for i, batch in enumerate(pbar):
-            if max_steps is not None and step >= max_steps: break
+            if max_steps is not None and step >= max_steps:
+                reached_max_steps = True
+                break
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE)
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1216,12 +1245,14 @@ def main():
                 ) / GRAD_ACCUM_STEPS
 
             loss.backward()
+            accum_micro_steps += 1
 
-            if (i+1) % GRAD_ACCUM_STEPS == 0:
+            if accum_micro_steps == GRAD_ACCUM_STEPS:
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
+                accum_micro_steps = 0
 
             if i % 10 == 0:
                 pbar.set_postfix({
@@ -1235,11 +1266,12 @@ def main():
                     'ireg': f"{inject_reg.item():.4f}",
                 })
 
-        if len(train_loader) % GRAD_ACCUM_STEPS != 0:
+        if accum_micro_steps > 0 and not reached_max_steps:
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
             optimizer.zero_grad()
             step += 1
+            accum_micro_steps = 0
 
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
