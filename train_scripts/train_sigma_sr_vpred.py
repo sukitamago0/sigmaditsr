@@ -21,6 +21,7 @@ from PIL import Image
 from torch.utils.data import RandomSampler
 
 from diffusion import IDDPM, DPMS
+from diffusion.model.gaussian_diffusion import _extract_into_tensor
 from diffusion.data.builder import build_dataset, build_dataloader, set_data_root
 from diffusion.model.builder import build_model
 from diffusion.utils.checkpoint import save_checkpoint, load_checkpoint
@@ -123,6 +124,7 @@ def log_validation(model, step, device, vae=None):
 
 
 def train():
+    """Dedicated SR v-pred training entry (decoupled from original train.py)."""
     if config.get('debug_nan', False):
         DebugUnderflowOverflow(model)
         logger.info('NaN debugger registered. Start to detect overflow during training.')
@@ -130,6 +132,7 @@ def train():
     log_buffer = LogBuffer()
 
     global_step = start_step + 1
+    micro_step = start_step * config.gradient_accumulation_steps
 
     load_vae_feat = getattr(train_dataloader.dataset, 'load_vae_feat', False)
     load_t5_feat = getattr(train_dataloader.dataset, 'load_t5_feat', False)
@@ -173,15 +176,33 @@ def train():
             grad_norm = None
             data_time_all += time.time() - data_time_start
             with accelerator.accumulate(model):
-                # Predict the noise residual
-                optimizer.zero_grad()
-                loss_term = train_diffusion.training_losses(model, clean_images, timesteps, model_kwargs=dict(y=y, mask=y_mask, data_info=data_info))
-                loss = loss_term['loss'].mean()
+                if micro_step % config.gradient_accumulation_steps == 0:
+                    optimizer.zero_grad()
+
+                noise = torch.randn_like(clean_images)
+                x_t = train_diffusion.q_sample(clean_images, timesteps, noise=noise)
+                model_out = model(x_t, timesteps, y=y, mask=y_mask, data_info=data_info)
+                model_out = model_out['x'] if isinstance(model_out, dict) else model_out
+                if model_out.shape[1] == clean_images.shape[1] * 2:
+                    model_pred = model_out[:, :clean_images.shape[1]].float()
+                else:
+                    model_pred = model_out.float()
+
+                alpha_t = _extract_into_tensor(train_diffusion.sqrt_alphas_cumprod, timesteps, clean_images.shape)
+                sigma_t = _extract_into_tensor(train_diffusion.sqrt_one_minus_alphas_cumprod, timesteps, clean_images.shape)
+                target_v = alpha_t * noise - sigma_t * clean_images.float()
+
+                snr = (alpha_t ** 2) / (sigma_t ** 2 + 1e-8)
+                min_snr_gamma = torch.minimum(snr, torch.full_like(snr, float(getattr(config, 'min_snr_gamma', 5.0))))
+                loss_weights = min_snr_gamma / (snr + 1e-8)
+                loss = (torch.nn.functional.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3]) * loss_weights.flatten(1).mean(dim=1)).mean()
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
-                optimizer.step()
-                lr_scheduler.step()
+                    optimizer.step()
+                    lr_scheduler.step()
+            micro_step += 1
 
             lr = lr_scheduler.get_last_lr()[0]
             logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
@@ -242,7 +263,7 @@ def train():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Process some integers.")
+    parser = argparse.ArgumentParser(description="PixArt-Sigma SR v-pred training (decoupled).")
     parser.add_argument("config", type=str, help="config")
     parser.add_argument("--cloud", action='store_true', default=False, help="cloud or local machine")
     parser.add_argument('--work-dir', help='the dir to save logs and models')
@@ -407,7 +428,7 @@ if __name__ == '__main__':
                     "kv_compress_config": kv_compress_config, "micro_condition": config.micro_condition}
 
     # build models
-    train_diffusion = IDDPM(str(config.train_sampling_steps), learn_sigma=learn_sigma, pred_sigma=pred_sigma, snr=config.snr_loss)
+    train_diffusion = IDDPM(str(config.train_sampling_steps), learn_sigma=learn_sigma, pred_sigma=pred_sigma, snr=False)
     model = build_model(config.model,
                         config.grad_checkpointing,
                         config.get('fp32_attention', False),

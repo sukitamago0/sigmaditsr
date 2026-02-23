@@ -818,13 +818,21 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert output.shape == target.shape == x_start.shape
+            if self.snr:
+                if self.model_mean_type == ModelMeanType.START_X:
+                    pred_noise = self._predict_eps_from_xstart(x_t=x_t, t=t, pred_xstart=output)
+                    pred_startx = output
+                elif self.model_mean_type == ModelMeanType.EPSILON:
+                    pred_noise = output
+                    pred_startx = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=output)
+                # terms["mse_eps"] = mean_flat((noise - pred_noise) ** 2)
+                # terms["mse_x0"] = mean_flat((x_start - pred_startx) ** 2)
+
+                t = t[:, None, None, None].expand(pred_startx.shape)  # [128, 4, 32, 32]
+                # best
+                target = th.where(t > 249, noise, x_start)
+                output = th.where(t > 249, pred_noise, pred_startx)
             loss = (target - output) ** 2
-            if self.snr and self.model_mean_type == ModelMeanType.EPSILON:
-                alphas_cumprod_t = _extract_into_tensor(self.alphas_cumprod, t, t.shape)
-                snr = alphas_cumprod_t / (1 - alphas_cumprod_t)
-                min_snr_gamma = 5.0
-                snr_weight = th.minimum(snr, th.full_like(snr, min_snr_gamma)) / snr.clamp(min=1e-8)
-                loss = loss * snr_weight[:, None, None, None]
             if model_kwargs.get('mask_ratio', False) and model_kwargs['mask_ratio'] > 0:
                 assert 'mask' in model_output
                 loss = F.avg_pool2d(loss.mean(dim=1), model.model.module.patch_size).flatten(1)
@@ -919,13 +927,21 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert output.shape == target.shape == x_start.shape
+            if self.snr:
+                if self.model_mean_type == ModelMeanType.START_X:
+                    pred_noise = self._predict_eps_from_xstart(x_t=x_t, t=t, pred_xstart=output)
+                    pred_startx = output
+                elif self.model_mean_type == ModelMeanType.EPSILON:
+                    pred_noise = output
+                    pred_startx = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=output)
+                # terms["mse_eps"] = mean_flat((noise - pred_noise) ** 2)
+                # terms["mse_x0"] = mean_flat((x_start - pred_startx) ** 2)
+
+                t = t[:, None, None, None].expand(pred_startx.shape)  # [128, 4, 32, 32]
+                # best
+                target = th.where(t > 249, noise, x_start)
+                output = th.where(t > 249, pred_noise, pred_startx)
             loss = (target - output) ** 2
-            if self.snr and self.model_mean_type == ModelMeanType.EPSILON:
-                alphas_cumprod_t = _extract_into_tensor(self.alphas_cumprod, t, t.shape)
-                snr = alphas_cumprod_t / (1 - alphas_cumprod_t)
-                min_snr_gamma = 5.0
-                snr_weight = th.minimum(snr, th.full_like(snr, min_snr_gamma)) / snr.clamp(min=1e-8)
-                loss = loss * snr_weight[:, None, None, None]
             terms["mse"] = mean_flat(loss)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
