@@ -107,6 +107,7 @@ NUM_WORKERS = 8
 LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
+TRAIN_PIXART_X_EMBEDDER = False  # keep False for "LoRA + injection modules only" training
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
 INJECTION_STRATEGY = "full"
@@ -775,6 +776,25 @@ def apply_lora(model, rank=64, alpha=64):
              setattr(parent, child, LoRALinear(module, rank, alpha)); cnt += 1
     print(f"✅ LoRA applied to {cnt} layers.")
 
+
+def configure_pixart_trainable_params(pixart: nn.Module, inject_gate_keys, train_x_embedder: bool = False):
+    # Freeze everything first, then unfreeze only the intended trainable subset.
+    for p in pixart.parameters():
+        p.requires_grad_(False)
+
+    trainable_names = []
+    for n, p in pixart.named_parameters():
+        is_lora = ("lora_A" in n) or ("lora_B" in n)
+        is_inject = any(k in n for k in inject_gate_keys)
+        is_x_embed = train_x_embedder and ("x_embedder" in n)
+        if is_lora or is_inject or is_x_embed:
+            p.requires_grad_(True)
+            trainable_names.append(n)
+
+    if len(trainable_names) == 0:
+        raise RuntimeError("No PixArt trainable parameters selected. Check freezing whitelist.")
+    print(f"✅ PixArt trainable configured: {len(trainable_names)} tensors (x_embedder={train_x_embedder})")
+
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
     if not math.isfinite(psnr_v): return (999, float("inf"))
@@ -1052,6 +1072,11 @@ def main():
         missing, unexpected = pixart.load_state_dict(base, strict=False)
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)}")
     apply_lora(pixart, LORA_RANK, LORA_ALPHA)
+    inject_gate_keys = (
+        "adapter_alpha_mlp", "input_adaln", "input_res_gate",
+        "style_fusion_mlp", "input_adapter_ln", "post_inject_dwconv", "post_inject_beta", "aug_embedder"
+    )
+    configure_pixart_trainable_params(pixart, inject_gate_keys=inject_gate_keys, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     pixart.train()
 
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).float().train()
@@ -1080,16 +1105,12 @@ def main():
     # [FIXED HERE] Process-Corrected Optimizer Grouping (Mutually Exclusive)
     adapter_params = list(adapter.parameters())
     
-    # 1. Select params for 'Fast Lane' (x_embedder)
+    # 1. Select params for trainable PixArt subset (LoRA + injection modules)
     embedder_params = []
     inject_gate_params = []
-    # 2. Select params for 'Slow Lane' (Backbone/LoRA)
+    lora_params = []
     other_pixart_params = []
 
-    inject_gate_keys = (
-        "adapter_alpha_mlp", "input_adaln", "input_res_gate",
-        "style_fusion_mlp", "input_adapter_ln", "post_inject_dwconv", "post_inject_beta", "aug_embedder"
-    )
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
@@ -1097,30 +1118,35 @@ def main():
             embedder_params.append(p)
         elif any(k in n for k in inject_gate_keys):
             inject_gate_params.append(p)
+        elif ('lora_A' in n) or ('lora_B' in n):
+            lora_params.append(p)
         else:
             other_pixart_params.append(p)
 
     # 3. Create Optimizer Groups
     optim_groups = [
         {"params": adapter_params, "lr": 1e-4},
-        {"params": embedder_params, "lr": 1e-4}, # Input Layer unlocked
         {"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0},
-        {"params": other_pixart_params, "lr": 1e-5}
+        {"params": lora_params, "lr": 1e-5},
     ]
-    optimizer = torch.optim.AdamW(optim_groups) 
-    
+    if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
+        optim_groups.append({"params": embedder_params, "lr": 1e-4})
+    optimizer = torch.optim.AdamW(optim_groups)
+
     # 2. Clipper needs flat tensor list
-    params_to_clip = adapter_params + embedder_params + inject_gate_params + other_pixart_params
+    params_to_clip = adapter_params + inject_gate_params + lora_params + embedder_params
 
     # Sanity checks: ensure pixart trainable params are fully and uniquely covered.
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = embedder_params + inject_gate_params + other_pixart_params
+    grouped = embedder_params + inject_gate_params + lora_params + other_pixart_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
         raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
-    if len(embedder_params) == 0 or len(inject_gate_params) == 0:
-        print(f"⚠️ Optimizer group warning: embedder={len(embedder_params)}, inject_gate={len(inject_gate_params)}")
+    if len(inject_gate_params) == 0 or len(lora_params) == 0:
+        print(f"⚠️ Optimizer group warning: inject_gate={len(inject_gate_params)}, lora={len(lora_params)}, x_embedder={len(embedder_params)}")
+    if len(other_pixart_params) != 0:
+        raise RuntimeError(f"Unexpected trainable backbone params outside whitelist: {len(other_pixart_params)}")
 
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
     # We will manually calculate v_target and loss.
@@ -1192,7 +1218,7 @@ def main():
                 # For v-prediction, standard MSE is weighted by SNR/(SNR+1) effectively.
                 # Here we use simplified MSE on V directly, which is robust.
                 # Optional: Add Min-SNR weighting:
-                loss_weights = min_snr_gamma / (snr + 1.0)
+                loss_weights = min_snr_gamma / snr
                 loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.view(-1)).mean()
 
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
