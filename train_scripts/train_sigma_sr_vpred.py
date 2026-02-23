@@ -830,6 +830,10 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         except Exception as e: print(f"⚠️ Base PixArt hash failed (non-fatal): {e}"); BASE_PIXART_SHA256 = None
     pixart_sd = collect_trainable_state_dict(pixart); required_frags = get_required_v7_key_fragments_for_model(pixart)
     v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
+    lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
+    if lora_key_count == 0:
+        raise RuntimeError("No LoRA keys found in pixart_trainable. Check apply_lora() and requires_grad flags.")
+    print(f"✅ LoRA save check: {lora_key_count} tensors")
     print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
     state = {
         "epoch": epoch, "step": global_step, "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
@@ -1124,7 +1128,7 @@ def main():
             # 2. Add noise to LR
             zlr_aug = zl.float() + torch.randn_like(zl) * aug_noise_level[:, None, None, None]
             # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
-            aug_level_emb = aug_noise_level * 1000.0
+            aug_level_emb = (aug_noise_level * 1000.0).float()
 
             cond = adapter(zlr_aug.float()) # Adapter sees augmented LR
             cond_in = cond
@@ -1159,8 +1163,8 @@ def main():
                 # For v-prediction, standard MSE is weighted by SNR/(SNR+1) effectively.
                 # Here we use simplified MSE on V directly, which is robust.
                 # Optional: Add Min-SNR weighting:
-                loss_weights = min_snr_gamma / snr # This balances the loss
-                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.squeeze()).mean()
+                loss_weights = min_snr_gamma / (snr + 1.0)
+                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.view(-1)).mean()
 
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
@@ -1230,6 +1234,12 @@ def main():
                     'w_flat': f"{w['flat_hf']:.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                 })
+
+        if len(train_loader) % GRAD_ACCUM_STEPS != 0:
+            torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            step += 1
 
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
