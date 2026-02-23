@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
+from diffusion.model.nets.PixArt_blocks import TimestepEmbedder
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
@@ -31,6 +32,7 @@ class PixArtSigmaSR(PixArtMS):
         self.hidden_size = self.x_embedder.proj.out_channels
         self.injection_cutoff_layer = injection_cutoff_layer
         self.force_null_caption = force_null_caption
+        self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
         self._init_injection_strategy(self.depth, mode=injection_strategy, sparse_ratio=sparse_inject_ratio)
         n = len(self.injection_layers)
@@ -145,6 +147,7 @@ class PixArtSigmaSR(PixArtMS):
         return feat.flatten(2).transpose(1, 2)
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
+        aug_level = kwargs.pop("aug_level", None)
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
@@ -159,6 +162,9 @@ class PixArtSigmaSR(PixArtMS):
 
         x = self.x_embedder(x) + pos_embed
         t = self.t_embedder(timestep)
+
+        if aug_level is not None:
+            t = t + self.aug_embedder(aug_level.to(self.dtype))
 
         if self.micro_conditioning:
             c_size, ar = data_info['img_hw'].to(self.dtype), data_info['aspect_ratio'].to(self.dtype)
