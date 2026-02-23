@@ -20,6 +20,12 @@ class PixArtSigmaSR(PixArtMS):
         force_null_caption: bool = True,
         **kwargs,
     ):
+        # Root-cause alignment for Sigma->SR adaptation:
+        # - Sigma checkpoint uses 300 text tokens.
+        # - SR script expects direct latent prediction branch (non-sigma head) by default.
+        kwargs.setdefault("model_max_length", 300)
+        kwargs.setdefault("pred_sigma", False)
+        kwargs.setdefault("learn_sigma", False)
         super().__init__(**kwargs)
         self.depth = len(self.blocks)
         self.hidden_size = self.x_embedder.proj.out_channels
@@ -60,6 +66,57 @@ class PixArtSigmaSR(PixArtMS):
         for conv in self.post_inject_dwconv:
             nn.init.zeros_(conv.weight)
             nn.init.zeros_(conv.bias)
+
+    def load_pretrained_weights_with_zero_init(self, state_dict):
+        """Shape-aware checkpoint loading for Sigma base -> SR backbone adaptation.
+
+        Handles deterministic structural differences:
+        - x_embedder input channels 4 -> 8 (concat z_t and z_lr)
+        - caption token table (120/300 variants)
+        - final_layer dimensions when pred_sigma/in_channels differ
+        """
+        own_state = self.state_dict()
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+
+        # Never load static position embedding directly.
+        state_dict = {k: v for k, v in state_dict.items() if k != "pos_embed"}
+
+        loaded, skipped = 0, 0
+        for name, param in state_dict.items():
+            if name not in own_state:
+                skipped += 1
+                continue
+
+            src = param.data if isinstance(param, nn.Parameter) else param
+            dst = own_state[name]
+
+            # Adapt first conv channels from 4->8 when needed.
+            if name == "x_embedder.proj.weight" and src.ndim == 4 and dst.ndim == 4 and src.shape[1] == 4 and dst.shape[1] == 8:
+                dst[:, :4, :, :] = src
+                dst[:, 4:, :, :] = src * 0.5
+                loaded += 1
+                continue
+
+            # Text embedding table: load overlapping prefix to support 120<->300 variants.
+            if name == "y_embedder.y_embedding" and src.ndim == 2 and dst.ndim == 2 and src.shape[1] == dst.shape[1] and src.shape[0] != dst.shape[0]:
+                n = min(src.shape[0], dst.shape[0])
+                dst[:n].copy_(src[:n])
+                loaded += 1
+                continue
+
+            # Final layer mismatch is expected between base and SR heads.
+            if name.startswith("final_layer.linear") and src.shape != dst.shape:
+                skipped += 1
+                continue
+
+            if src.shape == dst.shape:
+                dst.copy_(src)
+                loaded += 1
+            else:
+                skipped += 1
+
+        return loaded, skipped
 
     def _init_injection_strategy(self, depth, mode='front_dense', sparse_ratio=1.0):
         cutoff = min(self.injection_cutoff_layer, depth)

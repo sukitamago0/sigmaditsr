@@ -83,6 +83,7 @@ DIFFUSERS_ROOT = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "pixa
 TOKENIZER_PATH = os.path.join(DIFFUSERS_ROOT, "tokenizer")
 TEXT_ENCODER_PATH = os.path.join(DIFFUSERS_ROOT, "text_encoder")
 VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
+NULL_T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "null_t5_embed_sigma_300.pth")
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred")
@@ -139,7 +140,7 @@ VAL_MODE = "lr_dir"
 VAL_PACK_DIR = os.path.join(PROJECT_ROOT, "valpacks", "df2k_train_like_50_seed3407")
 VAL_PACK_LR_DIR_NAME = "lq512"
 TRAIN_DEG_MODE = "highorder"
-CFG_SCALE = 3.0
+CFG_SCALE = 1.0
 
 # [V8 Change] Default to LQ-Init for validation
 USE_LQ_INIT = True 
@@ -919,7 +920,7 @@ def resume(pixart, adapter, optimizer, dl_gen):
 
 # ================= 9. Validation =================
 @torch.no_grad()
-def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn):
+def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
     print(f"🔎 Validating Epoch {epoch+1}...")
     pixart.eval(); adapter.eval()
     results = {}
@@ -930,6 +931,14 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear",
         clip_sample=False, prediction_type="v_prediction", set_alpha_to_one=False,
     )
+
+    # Validation LPIPS must stay on CPU to reduce GPU memory peak.
+    try:
+        _lpips_dev = next(lpips_fn_val_cpu.parameters()).device
+        if _lpips_dev.type != "cpu":
+            raise RuntimeError(f"lpips_fn_val_cpu must be on CPU, got {_lpips_dev}")
+    except StopIteration:
+        pass
     
     steps_list = [FAST_VAL_STEPS] if FAST_DEV_RUN else VAL_STEPS_LIST
     for steps in steps_list:
@@ -940,13 +949,10 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
             z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
             
-            # [V8 Change] Default USE_LQ_INIT=True helps anchoring early training
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
             
             cond = adapter(z_lr.float())
-            
-            # Validation uses 0 noise augmentation level
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
@@ -966,8 +972,14 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
             p01 = (pred + 1) / 2; h01 = (hr + 1) / 2
             py = rgb01_to_y01(p01)[..., 4:-4, 4:-4]; hy = rgb01_to_y01(h01)[..., 4:-4, 4:-4]
-            if "psnr" in globals(): psnrs.append(psnr(py, hy, data_range=1.0).item()); ssims.append(ssim(py, hy, data_range=1.0).item())
-            lpipss.append(lpips_fn(pred, hr).mean().item())
+            if "psnr" in globals():
+                psnrs.append(psnr(py, hy, data_range=1.0).item()); ssims.append(ssim(py, hy, data_range=1.0).item())
+
+            pred_cpu = pred.detach().to("cpu", dtype=torch.float32)
+            hr_cpu = hr.detach().to("cpu", dtype=torch.float32)
+            lpipss.append(lpips_fn_val_cpu(pred_cpu, hr_cpu).mean().item())
+            del pred_cpu, hr_cpu
+
             if not vis_done:
                 save_path = os.path.join(VIS_DIR, f"epoch{epoch+1:03d}_steps{steps}.png")
                 lr_np = (lr[0].cpu().float().numpy().transpose(1,2,0) + 1) / 2
@@ -988,7 +1000,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
 # ================= 10. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
-    required_paths = [PIXART_PATH, TOKENIZER_PATH, TEXT_ENCODER_PATH, VAE_PATH]
+    required_paths = [PIXART_PATH, VAE_PATH, NULL_T5_EMBED_PATH]
     for pth in required_paths:
         if not os.path.exists(pth):
             raise FileNotFoundError(f"Required pretrained path missing: {pth}")
@@ -1032,17 +1044,22 @@ def main():
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
     vae.enable_slicing()
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
-    lpips_fn = lpips.LPIPS(net='vgg').to(DEVICE).eval()
-    for p in vae.parameters(): p.requires_grad_(False)
-    for p in lpips_fn.parameters(): p.requires_grad_(False)
 
-    tokenizer = T5Tokenizer.from_pretrained(TOKENIZER_PATH, local_files_only=True)
-    text_encoder = T5EncoderModel.from_pretrained(TEXT_ENCODER_PATH, local_files_only=True).to(DEVICE).eval()
-    for p in text_encoder.parameters():
-        p.requires_grad_(False)
-    with torch.no_grad():
-        null_tokens = tokenizer("", max_length=120, padding="max_length", truncation=True, return_tensors="pt").to(DEVICE)
-        y = text_encoder(null_tokens.input_ids, attention_mask=null_tokens.attention_mask)[0].unsqueeze(1)
+    lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
+    for p in vae.parameters(): p.requires_grad_(False)
+    for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
+    print("✅ Validation LPIPS is on CPU.")
+    lpips_fn_train = None  # lazy-init on GPU when/if training LPIPS becomes active
+
+    if not os.path.exists(NULL_T5_EMBED_PATH):
+        raise FileNotFoundError(f"Null T5 embed not found: {NULL_T5_EMBED_PATH}")
+    null_pack = torch.load(NULL_T5_EMBED_PATH, map_location="cpu")
+    if "y" not in null_pack:
+        raise KeyError(f"Invalid null T5 embed file (missing key 'y'): {NULL_T5_EMBED_PATH}")
+    y = null_pack["y"].to(DEVICE)
+    if y.ndim != 4:
+        raise RuntimeError(f"Invalid y shape from offline null T5 embed: {tuple(y.shape)} (expected [1,1,L,C])")
+    print(f"✅ Loaded offline null T5 embedding: y.shape={tuple(y.shape)}")
 
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
@@ -1181,7 +1198,12 @@ def main():
                     img_t_valid = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
                     
                     if w['lpips'] > 0:
-                        loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
+                        if lpips_fn_train is None:
+                            lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval()
+                            for p in lpips_fn_train.parameters():
+                                p.requires_grad_(False)
+                            print("✅ Training LPIPS initialized on GPU (lazy init).")
+                        loss_lpips = lpips_fn_train(img_p_valid, img_t_valid).mean()
 
                     if w['edge_grad'] > 0 or w['flat_hf'] > 0:
                         loss_edge, loss_flat_hf, _ = edge_guided_losses(
@@ -1223,7 +1245,7 @@ def main():
                 })
 
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
-        val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn)
+        val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
         if int(BEST_VAL_STEPS) in val_dict: metrics = val_dict[int(BEST_VAL_STEPS)]
         else: metrics = next(iter(val_dict.values()))
         best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen)
