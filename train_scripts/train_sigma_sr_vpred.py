@@ -1065,7 +1065,7 @@ def main():
     if "x_embedder.proj.weight" in base and base["x_embedder.proj.weight"].shape[1] == 4:
         w4 = base["x_embedder.proj.weight"]
         w8 = torch.zeros((w4.shape[0], 8, w4.shape[2], w4.shape[3]), dtype=w4.dtype)
-        w8[:, :4] = w4; base["x_embedder.proj.weight"] = w8
+        w8[:, :4] = w4; w8[:, 4:] = w4 * 0.5; base["x_embedder.proj.weight"] = w8
     if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
         pixart.load_pretrained_weights_with_zero_init(base)
     else:
@@ -1130,7 +1130,7 @@ def main():
         {"params": lora_params, "lr": 1e-5},
     ]
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 5e-5})
+        optim_groups.append({"params": embedder_params, "lr": 1e-4})
     optimizer = torch.optim.AdamW(optim_groups)
 
     # 2. Clipper needs flat tensor list
