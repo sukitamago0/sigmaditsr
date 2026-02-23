@@ -157,6 +157,7 @@ output_all/
 output_demo/
 output_debug/
 output/
+experiments_results/
 
 #cache for docker
 docker/cache/gradio
