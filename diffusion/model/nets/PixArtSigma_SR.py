@@ -35,7 +35,11 @@ class PixArtSigmaSR(PixArtMS):
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
         self._init_injection_strategy(self.depth, mode=injection_strategy, sparse_ratio=sparse_inject_ratio)
+        self.injection_layer_to_level = self._build_injection_layer_to_level(self.depth)
+        self.register_buffer("injection_depth_decay", self._build_injection_depth_decay(depth=self.depth, r_end=0.1), persistent=True)
         n = len(self.injection_layers)
+        self.injection_scales = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(n)])
+        self._init_injection_scales(depth=self.depth, s_max=1.0, s_min=0.1, p=2.0)
 
         self.style_fusion_mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
@@ -50,24 +54,14 @@ class PixArtSigmaSR(PixArtMS):
         )
         self.input_adapter_ln = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
         self.input_adaln = nn.ModuleList([nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True) for _ in range(n)])
-        self.input_res_gate = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(n)])
-
-        # requested 1D<->2D post-fusion path
-        self.post_inject_dwconv = nn.ModuleList([
-            nn.Conv2d(self.hidden_size, self.hidden_size, kernel_size=3, stride=1, padding=1, groups=self.hidden_size)
-            for _ in range(n)
-        ])
-        self.post_inject_beta = nn.ParameterList([nn.Parameter(torch.zeros(1)) for _ in range(n)])
+        self.input_res_proj = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(n)])
 
         for lin in self.input_adaln:
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
-        for lin in self.input_res_gate:
+        for lin in self.input_res_proj:
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
-        for conv in self.post_inject_dwconv:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
 
     def load_pretrained_weights_with_zero_init(self, state_dict):
         """Shape-aware checkpoint loading for Sigma base -> SR backbone adaptation.
@@ -138,6 +132,34 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self.injection_layers = [l for l in all_layers if l < self.injection_cutoff_layer]
 
+    def _build_injection_depth_decay(self, depth: int, r_end: float = 0.1):
+        x = torch.linspace(0, 1, depth)
+        decay = r_end + (1 - r_end) * (1 - x)
+        return decay
+
+    def _build_injection_layer_to_level(self, depth: int):
+        m = {}
+        for lid in range(depth):
+            if lid < 8:
+                lvl = 0
+            elif lid < 15:
+                lvl = 1
+            elif lid < 22:
+                lvl = 2
+            else:
+                lvl = 3
+            m[lid] = lvl
+        return m
+
+    def _init_injection_scales(self, depth: int, s_max: float = 1.0, s_min: float = 0.1, p: float = 2.0):
+        if len(self.injection_layers) == 0:
+            return
+        denom = float(max(1, depth - 1))
+        for i, layer_idx in enumerate(self.injection_layers):
+            u = float(layer_idx) / denom
+            init_val = s_max - (s_max - s_min) * (u ** p)
+            self.injection_scales[i].data.fill_(init_val)
+
     def _tokens_to_map(self, tokens):
         b, n, c = tokens.shape
         assert n == self.h * self.w
@@ -206,15 +228,26 @@ class PixArtSigmaSR(PixArtMS):
                 with torch.cuda.amp.autocast(enabled=False):
                     feat = self.input_adapter_ln(feat.float())
                     adaln_shift, adaln_scale = self.input_adaln[scale_idx](feat).chunk(2, dim=-1)
-                    x_norm = self.input_adapter_ln(x.float())
-                    adaln_delta = alpha.float() * (x_norm * adaln_scale + adaln_shift)
-                    res_delta = alpha.float() * self.input_res_gate[scale_idx](feat)
-                    delta = adaln_delta + res_delta
-                    delta_2d = self._tokens_to_map(delta)
-                    delta_2d = self.post_inject_dwconv[scale_idx](delta_2d)
-                    delta = self._map_to_tokens(delta_2d) * torch.tanh(self.post_inject_beta[scale_idx])
+                res = self.input_res_proj[scale_idx](feat)
+                layer_decay = self.injection_depth_decay[i].to(device=alpha.device, dtype=alpha.dtype).view(1, 1, 1)
+                layer_alpha = F.softplus(self.injection_scales[scale_idx]) * layer_decay * alpha
+                x = x + layer_alpha * res.to(x.dtype)
 
-                x = x + delta.to(x.dtype)
+                x = auto_grad_checkpoint(
+                    block,
+                    x,
+                    y,
+                    t0,
+                    y_lens,
+                    HW=(self.h, self.w),
+                    base_size=self.base_size,
+                    pe_interpolation=self.pe_interpolation,
+                    adaln_shift=adaln_shift,
+                    adaln_scale=adaln_scale,
+                    adaln_alpha=layer_alpha,
+                    **kwargs,
+                )
+                continue
 
             # non-invasive: do not change native block internals
             x = auto_grad_checkpoint(

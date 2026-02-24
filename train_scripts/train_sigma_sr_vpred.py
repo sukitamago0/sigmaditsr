@@ -49,8 +49,8 @@ BASE_PIXART_SHA256 = None
 
 # Added "aug_embedder" to required keys
 V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
-    "input_adaln", "adapter_alpha_mlp", "input_res_gate",
-    "input_adapter_ln", "style_fusion_mlp", "post_inject_dwconv", "post_inject_beta", "aug_embedder"
+    "input_adaln", "adapter_alpha_mlp", "input_res_proj",
+    "input_adapter_ln", "style_fusion_mlp", "aug_embedder", "injection_scales"
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 
@@ -1073,8 +1073,8 @@ def main():
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)}")
     apply_lora(pixart, LORA_RANK, LORA_ALPHA)
     inject_gate_keys = (
-        "adapter_alpha_mlp", "input_adaln", "input_res_gate",
-        "style_fusion_mlp", "input_adapter_ln", "post_inject_dwconv", "post_inject_beta", "aug_embedder"
+        "adapter_alpha_mlp", "input_adaln", "input_res_proj",
+        "style_fusion_mlp", "input_adapter_ln", "aug_embedder", "injection_scales"
     )
     configure_pixart_trainable_params(pixart, inject_gate_keys=inject_gate_keys, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     pixart.train()

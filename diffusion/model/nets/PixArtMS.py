@@ -70,9 +70,15 @@ class PixArtMSBlock(nn.Module):
 
     def forward(self, x, y, t, mask=None, HW=None, **kwargs):
         B, N, C = x.shape
+        adaln_shift = kwargs.get("adaln_shift", None)
+        adaln_scale = kwargs.get("adaln_scale", None)
+        adaln_alpha = kwargs.get("adaln_alpha", None)
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(self.norm1(x), shift_msa, scale_msa), HW=HW))
+        h = self.norm1(x)
+        if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
+            h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
+        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
         x = x + self.cross_attn(x, y, mask)
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
 
