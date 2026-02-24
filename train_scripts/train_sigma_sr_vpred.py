@@ -107,15 +107,15 @@ NUM_WORKERS = 8
 LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
-TRAIN_PIXART_X_EMBEDDER = False  # keep False for "LoRA + injection modules only" training
+TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_embedder
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
 INJECTION_STRATEGY = "full"
 
 # [V8 Augmentation]
-COND_AUG_NOISE_RANGE = (0.0, 0.15) 
+COND_AUG_NOISE_RANGE = (0.0, 0.05) 
 
-WARMUP_STEPS = 4000        
+WARMUP_STEPS = 4000         
 RAMP_UP_STEPS = 5000         
 TARGET_LPIPS_WEIGHT = 0.50
 LPIPS_BASE_WEIGHT = 0.0      
@@ -1065,7 +1065,7 @@ def main():
     if "x_embedder.proj.weight" in base and base["x_embedder.proj.weight"].shape[1] == 4:
         w4 = base["x_embedder.proj.weight"]
         w8 = torch.zeros((w4.shape[0], 8, w4.shape[2], w4.shape[3]), dtype=w4.dtype)
-        w8[:, :4] = w4; base["x_embedder.proj.weight"] = w8
+        w8[:, :4] = w4; w8[:, 4:] = w4 * 0.5; base["x_embedder.proj.weight"] = w8
     if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
         pixart.load_pretrained_weights_with_zero_init(base)
     else:
