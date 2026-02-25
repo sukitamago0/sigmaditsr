@@ -145,9 +145,12 @@ INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
 COND_DROP_PROB = 0.10
 FORCE_DROP_TEXT = True  # validation-time text drop behavior
-INJECT_SCALE_REG_LAMBDA = 1e-4
-PIXEL_LOSS_T_MAX = 250
-PIXEL_LOSS_START_STEP = WARMUP_STEPS
+INJECT_SCALE_REG_LAMBDA = 5e-5
+# B1-stable: enable pixel losses progressively instead of opening all at once.
+PIXEL_LOSS_T_MAX_START = 250
+PIXEL_LOSS_T_MAX_TARGET = 400
+PIXEL_LOSS_RAMP_STEPS = 8000
+PIXEL_LOSS_START_STEP = 2000
 
 USE_LR_CONSISTENCY = False 
 USE_NOISE_CONSISTENCY = False
@@ -181,6 +184,30 @@ def get_loss_weights(global_step):
     weights['edge_grad'] = EDGE_GRAD_WEIGHT * edge_progress
     weights['flat_hf'] = FLAT_HF_WEIGHT * edge_progress
     return weights
+
+def get_pixel_loss_schedule(global_step: int):
+    """Progressively increase pixel-loss coverage for B1-stable training."""
+    if global_step < PIXEL_LOSS_START_STEP:
+        return PIXEL_LOSS_T_MAX_START, 0.0
+    if PIXEL_LOSS_RAMP_STEPS <= 0:
+        return PIXEL_LOSS_T_MAX_TARGET, 1.0
+    progress = min(1.0, max(0.0, (global_step - PIXEL_LOSS_START_STEP) / float(PIXEL_LOSS_RAMP_STEPS)))
+    t_max = int(round(PIXEL_LOSS_T_MAX_START + (PIXEL_LOSS_T_MAX_TARGET - PIXEL_LOSS_T_MAX_START) * progress))
+    apply_prob = 0.25 + 0.75 * progress
+    return t_max, apply_prob
+
+
+def sanitize_injection_scales(model: nn.Module, clamp_max: float = 20.0):
+    if not hasattr(model, "injection_scales"):
+        return True
+    ok = True
+    with torch.no_grad():
+        for p in model.injection_scales:
+            if not torch.isfinite(p).all():
+                ok = False
+                p.data = torch.nan_to_num(p.data, nan=0.0, posinf=clamp_max, neginf=-clamp_max)
+            p.data.clamp_(-clamp_max, clamp_max)
+    return ok
 
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
@@ -359,6 +386,11 @@ def get_config_snapshot():
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights": "Dynamic",
+        "inject_scale_reg_lambda": INJECT_SCALE_REG_LAMBDA,
+        "pixel_loss_tmax_start": PIXEL_LOSS_T_MAX_START,
+        "pixel_loss_tmax_target": PIXEL_LOSS_T_MAX_TARGET,
+        "pixel_loss_start_step": PIXEL_LOSS_START_STEP,
+        "pixel_loss_ramp_steps": PIXEL_LOSS_RAMP_STEPS,
         "seed": SEED,
     }
 
@@ -1132,7 +1164,7 @@ def main():
     # 3. Create Optimizer Groups
     optim_groups = [
         {"params": adapter_params, "lr": 1e-4},
-        {"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0},
+        {"params": inject_gate_params, "lr": 5e-5, "weight_decay": 0.0},
         {"params": lora_params, "lr": 1e-5},
         {"params": other_pixart_params, "lr": 1e-5},
     ]
@@ -1201,6 +1233,11 @@ def main():
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()
                 cond_in = mask_adapter_cond(cond, keep)
 
+            if i % 50 == 0:
+                scales_ok = sanitize_injection_scales(pixart)
+                if not scales_ok:
+                    print(f"⚠️ [NumGuard] Non-finite injection_scales sanitized at ep={epoch+1}, iter={i}, step={step}")
+
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
                 # Pass zlr_aug to concat as well (Consistency!)
@@ -1244,9 +1281,11 @@ def main():
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
 
                 need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0)
-                allow_by_t = int(t[0].item()) <= PIXEL_LOSS_T_MAX
+                pixel_tmax, pixel_apply_prob = get_pixel_loss_schedule(step)
+                allow_by_t = int(t[0].item()) <= pixel_tmax
                 allow_by_step = step >= PIXEL_LOSS_START_STEP
-                calc_pixel_loss = need_pixel_loss and allow_by_t and allow_by_step
+                allow_by_prob = bool(torch.rand((), device=DEVICE).item() < pixel_apply_prob)
+                calc_pixel_loss = need_pixel_loss and allow_by_t and allow_by_step and allow_by_prob
 
                 if calc_pixel_loss:
                     top = torch.randint(0, 25, (1,), device=DEVICE).item() 
@@ -1280,12 +1319,30 @@ def main():
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
+            if not torch.isfinite(loss):
+                print(
+                    f"⚠️ [NumGuard] Non-finite loss, skip step. ep={epoch+1} iter={i} step={step} "
+                    f"v={float(loss_v):.4f} l1={float(loss_latent_l1):.4f} lp={float(loss_lpips):.4f} "
+                    f"edge={float(loss_edge):.4f} flat={float(loss_flat_hf):.4f} ireg={float(inject_reg):.4f}"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                accum_micro_steps = 0
+                sanitize_injection_scales(pixart)
+                continue
+
             loss.backward()
             accum_micro_steps += 1
 
             if accum_micro_steps == GRAD_ACCUM_STEPS:
-                torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+                total_norm = torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+                if not torch.isfinite(total_norm):
+                    print(f"⚠️ [NumGuard] Non-finite grad norm ({float(total_norm)}), skip optimizer.step at step={step}")
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_micro_steps = 0
+                    sanitize_injection_scales(pixart)
+                    continue
                 optimizer.step()
+                sanitize_injection_scales(pixart)
                 optimizer.zero_grad()
                 step += 1
                 accum_micro_steps = 0
@@ -1300,13 +1357,21 @@ def main():
                     'w_edge': f"{w['edge_grad']:.3f}",
                     'w_flat': f"{w['flat_hf']:.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
+                    'ptmax': f"{pixel_tmax}",
+                    'pprob': f"{pixel_apply_prob:.2f}",
                 })
 
         if accum_micro_steps > 0 and not reached_max_steps:
-            torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            step += 1
+            total_norm = torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+            if torch.isfinite(total_norm):
+                optimizer.step()
+                sanitize_injection_scales(pixart)
+                optimizer.zero_grad()
+                step += 1
+            else:
+                print(f"⚠️ [NumGuard] Non-finite grad norm on tail flush ({float(total_norm)}), skip optimizer.step at step={step}")
+                optimizer.zero_grad(set_to_none=True)
+                sanitize_injection_scales(pixart)
             accum_micro_steps = 0
 
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
