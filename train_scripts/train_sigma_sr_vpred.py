@@ -108,8 +108,9 @@ LR_BASE = 1e-5
 LORA_RANK = 16
 LORA_ALPHA = 16
 TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_embedder
-# Stage-A anti-forgetting switch: freeze broad PixArt backbone lane and only train adapter/inject(+LoRA,+x_embedder).
-STAGE_A_FREEZE_OTHER_PIXART = True
+# Stage-A anti-forgetting switch: keep PixArt backbone trainable by default.
+# Set STAGE_A_FREEZE_OTHER_PIXART=1 to force adapter-only training.
+STAGE_A_FREEZE_OTHER_PIXART = os.getenv("STAGE_A_FREEZE_OTHER_PIXART", "0") == "1"
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
 INJECTION_STRATEGY = "full"
