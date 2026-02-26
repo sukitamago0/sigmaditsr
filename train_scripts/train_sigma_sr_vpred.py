@@ -108,6 +108,8 @@ LR_BASE = 1e-5
 LORA_RANK = 16
 LORA_ALPHA = 16
 TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_embedder
+# Stage-A anti-forgetting switch: freeze broad PixArt backbone lane and only train adapter/inject(+LoRA,+x_embedder).
+STAGE_A_FREEZE_OTHER_PIXART = True
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
 INJECTION_STRATEGY = "full"
@@ -384,6 +386,7 @@ def get_config_snapshot():
         "lr_base": LR_BASE,
         "lora_rank": LORA_RANK,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
+        "stage_a_freeze_other_pixart": STAGE_A_FREEZE_OTHER_PIXART,
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights": "Dynamic",
         "inject_scale_reg_lambda": INJECT_SCALE_REG_LAMBDA,
@@ -1161,13 +1164,20 @@ def main():
         else:
             other_pixart_params.append(p)
 
+    if STAGE_A_FREEZE_OTHER_PIXART and len(other_pixart_params) > 0:
+        for p in other_pixart_params:
+            p.requires_grad_(False)
+        print(f"✅ Stage-A freeze enabled: froze {len(other_pixart_params)} other PixArt tensors.")
+        other_pixart_params = []
+
     # 3. Create Optimizer Groups
     optim_groups = [
         {"params": adapter_params, "lr": 1e-4},
         {"params": inject_gate_params, "lr": 5e-5, "weight_decay": 0.0},
         {"params": lora_params, "lr": 1e-5},
-        {"params": other_pixart_params, "lr": 1e-5},
     ]
+    if len(other_pixart_params) > 0:
+        optim_groups.append({"params": other_pixart_params, "lr": 1e-5})
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
         optim_groups.append({"params": embedder_params, "lr": 1e-4})
     optimizer = torch.optim.AdamW(optim_groups)
