@@ -123,6 +123,8 @@ RAMP_UP_STEPS = 5000
 TARGET_LPIPS_WEIGHT = 0.50
 LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 1.0
+LATENT_L1_T_MAX = 200       # only apply latent L1 at low-noise timesteps
+LATENT_L1_DECAY_STEPS = 12000  # linearly decay latent L1 weight to zero for anti-over-smoothing
 EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
 FLAT_HF_WEIGHT   = 0.05     # flat/defocus HF suppression (Laplacian)
 EDGE_Q           = 0.90     # GT edge quantile for normalization
@@ -187,6 +189,14 @@ def get_loss_weights(global_step):
     weights['edge_grad'] = EDGE_GRAD_WEIGHT * edge_progress
     weights['flat_hf'] = FLAT_HF_WEIGHT * edge_progress
     return weights
+
+
+def get_latent_l1_decay(global_step: int) -> float:
+    """Linearly decay latent-L1 contribution so diffusion prior dominates later training."""
+    if LATENT_L1_DECAY_STEPS <= 0:
+        return 0.0
+    progress = min(1.0, max(0.0, global_step / float(LATENT_L1_DECAY_STEPS)))
+    return 1.0 - progress
 
 def get_pixel_loss_schedule(global_step: int):
     """Progressively increase pixel-loss coverage for B1-stable training."""
@@ -393,6 +403,8 @@ def get_config_snapshot():
         "inject_scale_reg_lambda": INJECT_SCALE_REG_LAMBDA,
         "pixel_loss_tmax_start": PIXEL_LOSS_T_MAX_START,
         "pixel_loss_tmax_target": PIXEL_LOSS_T_MAX_TARGET,
+        "latent_l1_t_max": LATENT_L1_T_MAX,
+        "latent_l1_decay_steps": LATENT_L1_DECAY_STEPS,
         "pixel_loss_start_step": PIXEL_LOSS_START_STEP,
         "pixel_loss_ramp_steps": PIXEL_LOSS_RAMP_STEPS,
         "seed": SEED,
@@ -1282,9 +1294,14 @@ def main():
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
 
-                loss_latent_l1 = F.l1_loss(z0, zh.float())
+                latent_l1_active = (t <= LATENT_L1_T_MAX).float()
+                latent_l1_per = F.l1_loss(z0, zh.float(), reduction='none').mean(dim=[1, 2, 3])
+                active_count = latent_l1_active.sum().clamp_min(1.0)
+                loss_latent_l1 = (latent_l1_per * latent_l1_active).sum() / active_count
 
                 w = get_loss_weights(step)
+                latent_l1_decay = get_latent_l1_decay(step)
+                latent_l1_weight = w['latent_l1'] * latent_l1_decay
                 
                 # Calculate pixel-space losses
                 loss_edge = torch.tensor(0.0, device=DEVICE)
@@ -1324,7 +1341,7 @@ def main():
                 inject_reg = compute_injection_scale_reg(pixart, INJECT_SCALE_REG_LAMBDA)
                 loss = (
                     loss_v 
-                    + w['latent_l1']*loss_latent_l1
+                    + latent_l1_weight * loss_latent_l1
                     + w['lpips']*loss_lpips
                     + w['edge_grad'] * loss_edge + w['flat_hf'] * loss_flat_hf
                     + inject_reg
@@ -1362,6 +1379,8 @@ def main():
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
+                    'w_lat_l1': f"{latent_l1_weight:.3f}",
+                    'lat_t%': f"{latent_l1_active.mean().item():.2f}",
                     'lp': f"{loss_lpips:.3f}",
                     'edge': f"{loss_edge.item():.3f}",
                     'flat_hf': f"{loss_flat_hf.item():.3f}",
