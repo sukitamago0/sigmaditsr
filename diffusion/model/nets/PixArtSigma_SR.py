@@ -19,6 +19,10 @@ class PixArtSigmaSR(PixArtMS):
         injection_cutoff_layer: int = 25,
         injection_strategy: str = "front_dense",
         force_null_caption: bool = True,
+        injection_r_end: float = 0.1,
+        injection_s_min: float = 0.1,
+        injection_s_max: float = 1.0,
+        injection_init_p: float = 2.0,
         **kwargs,
     ):
         # Root-cause alignment for Sigma->SR adaptation:
@@ -36,10 +40,10 @@ class PixArtSigmaSR(PixArtMS):
 
         self._init_injection_strategy(self.depth, mode=injection_strategy, sparse_ratio=sparse_inject_ratio)
         self.injection_layer_to_level = self._build_injection_layer_to_level(self.depth)
-        self.register_buffer("injection_depth_decay", self._build_injection_depth_decay(depth=self.depth, r_end=0.1), persistent=True)
+        self.register_buffer("injection_depth_decay", self._build_injection_depth_decay(depth=self.depth, r_end=float(injection_r_end)), persistent=True)
         n = len(self.injection_layers)
         self.injection_scales = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(n)])
-        self._init_injection_scales(depth=self.depth, s_max=1.0, s_min=0.1, p=2.0)
+        self._init_injection_scales(depth=self.depth, s_max=float(injection_s_max), s_min=float(injection_s_min), p=float(injection_init_p))
 
         self.style_fusion_mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
