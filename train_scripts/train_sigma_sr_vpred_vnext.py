@@ -202,7 +202,7 @@ def get_loss_weights(global_step):
     else:
         edge_progress = min(1.0, (global_step - EDGE_WARMUP_STEPS) / EDGE_RAMP_STEPS)
     weights['edge_grad'] = EDGE_GRAD_WEIGHT * edge_progress
-    weights['flat_hf'] = FLAT_HF_WEIGHT * edge_progress
+    weights['flat_hf'] = 0.0 if USE_LR_CONSISTENCY else (FLAT_HF_WEIGHT * edge_progress)
 
     if not USE_LR_CONSISTENCY:
         weights['lr_cons'] = 0.0
@@ -1045,7 +1045,7 @@ def _strict_load_pixart_trainable_subset(pixart: nn.Module, saved_trainable: dic
         curr[k] = saved_trainable[k].to(dtype=curr[k].dtype)
     pixart.load_state_dict(curr, strict=False)
 
-def resume(pixart, adapter, optimizer, dl_gen, ema=None):
+def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
@@ -1077,7 +1077,15 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None):
     if ema is not None:
         ema_sd = ckpt.get("ema_state", None)
         if isinstance(ema_sd, dict) and len(ema_sd) > 0:
-            ema.shadow = {k: v.float() for k, v in ema_sd.items()}
+            dev_map = {}
+            if ema_named_params is not None:
+                dev_map = {name: p.device for name, p in ema_named_params}
+            restored = {}
+            for k, v in ema_sd.items():
+                if k not in dev_map:
+                    continue
+                restored[k] = v.float().to(device=dev_map[k])
+            ema.shadow = restored
             print(f"✅ EMA restored: {len(ema.shadow)} tensors")
         else:
             print("ℹ️ EMA state not found in checkpoint; proceeding without EMA restore.")
@@ -1302,7 +1310,7 @@ def main():
         ema.register(ema_named_params)
         print(f"✅ EMA enabled: decay={EMA_DECAY}, track_set={EMA_TRACK_SET}, tensors={len(ema_named_params)}")
 
-    ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen, ema=ema)
+    ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
@@ -1384,7 +1392,7 @@ def main():
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
 
-                need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0)
+                need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0) or (w.get('lr_cons', 0.0) > 0)
                 allow_by_t = int(t[0].item()) <= PIXEL_LOSS_T_MAX
                 allow_by_step = step >= PIXEL_LOSS_START_STEP
                 calc_pixel_loss = need_pixel_loss and allow_by_t and allow_by_step
