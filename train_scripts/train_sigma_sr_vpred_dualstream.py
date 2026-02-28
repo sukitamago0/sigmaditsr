@@ -1129,7 +1129,8 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     saved_trainable = ckpt.get("pixart_trainable", {})
     required_frags = get_required_v7_key_fragments_for_model(pixart)
     missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
-    if missing_required: raise RuntimeError("Checkpoint is missing required v7 trainable keys: " + ", ".join(missing_required))
+    if missing_required:
+        print("⚠️ Checkpoint missing some currently-trainable fragments (stage-switch expected): " + ", ".join(missing_required))
 
     adapter_sd = ckpt.get("adapter", {})
     try:
