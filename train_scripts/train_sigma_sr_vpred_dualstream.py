@@ -170,6 +170,7 @@ RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.Interpol
 USE_EMA = True
 EMA_DECAY = 0.999
 EMA_TRACK_SET = "small"  # small | all
+EMA_VALIDATE = False  # if True, run an extra EMA validation pass each epoch
 
 T_SAMPLE_MODE = "power"   # uniform | power | two_stage
 T_SAMPLE_POWER = 2.5
@@ -1511,23 +1512,20 @@ def main():
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
         print("🔎 [VAL] Raw weights")
         val_raw = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
-        val_ema = None
-        if ema is not None:
+
+        # Optional EMA validation pass (disabled by default to save epoch time).
+        if ema is not None and EMA_VALIDATE:
             print("🔎 [VAL] EMA weights")
             ema.apply(ema_named_params)
             val_ema = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
             ema.restore(ema_named_params)
-
-        if val_ema is not None:
             if int(BEST_VAL_STEPS) in val_raw and int(BEST_VAL_STEPS) in val_ema:
                 r = val_raw[int(BEST_VAL_STEPS)]
                 e = val_ema[int(BEST_VAL_STEPS)]
                 print(f"[VAL-CMP@{BEST_VAL_STEPS}] raw: PSNR={r[0]:.2f} SSIM={r[1]:.4f} LPIPS={r[2]:.4f} | "
                       f"ema: PSNR={e[0]:.2f} SSIM={e[1]:.4f} LPIPS={e[2]:.4f}")
-            metrics = val_ema[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_ema else next(iter(val_ema.values()))
-        else:
-            metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
 
+        metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
         best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen, ema=ema)
 
 if __name__ == "__main__":
