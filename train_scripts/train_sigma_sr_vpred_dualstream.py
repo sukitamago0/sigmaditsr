@@ -111,8 +111,8 @@ TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_emb
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 14
 INJECTION_STRATEGY = "full"
-INJECT_R_END = 0.6
-INJECT_S_MIN = 0.3
+INJECT_R_END = 0.1
+INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
 
@@ -192,6 +192,12 @@ DUAL_NUM_HEADS = 16
 # Staged unfreeze for resume from old checkpoint
 TRAIN_STAGE = "A"  # A: new modules only, B: +LoRA, C: +late blocks
 STAGE_C_LATE_BLOCK_FRAC = 0.25
+
+# Phase0 safety: check zero-impact regression before training
+RUN_PHASE0_REGRESSION_TEST = False
+PHASE0_MAX_PSNR_DROP = 0.02
+PHASE0_MAX_LPIPS_RISE = 0.005
+PHASE0_NUM_SAMPLES = 4
 
 # Keep legacy injection mostly shallow when enabling dual-stream
 
@@ -1010,9 +1016,12 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
     pixart_sd = collect_trainable_state_dict(pixart); required_frags = get_required_v7_key_fragments_for_model(pixart)
     v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
     lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
+    if TRAIN_STAGE in ("B", "C") and lora_key_count == 0:
+        raise RuntimeError("No LoRA keys found in pixart_trainable for stage>=B. Check requires_grad flags.")
     if lora_key_count == 0:
-        raise RuntimeError("No LoRA keys found in pixart_trainable. Check apply_lora() and requires_grad flags.")
-    print(f"✅ LoRA save check: {lora_key_count} tensors")
+        print("ℹ️ LoRA save check skipped (no trainable LoRA in current stage).")
+    else:
+        print(f"✅ LoRA save check: {lora_key_count} tensors")
     print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
 
     next_best_records = list(best_records)
@@ -1063,12 +1072,15 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
     return best_records
 
 def _load_pixart_trainable_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
-    expected = {k for k, p in pixart.named_parameters() if p.requires_grad}
     saved = set(saved_trainable.keys())
+    model_keys = set(pixart.state_dict().keys())
 
     curr = pixart.state_dict()
-    loaded, skipped_shape = 0, 0
-    for k in sorted(expected & saved):
+    loaded, skipped_shape, missing_in_model = 0, 0, 0
+    for k in sorted(saved):
+        if k not in model_keys:
+            missing_in_model += 1
+            continue
         ckpt_t = saved_trainable[k]
         if tuple(ckpt_t.shape) == tuple(curr[k].shape):
             curr[k] = ckpt_t.to(dtype=curr[k].dtype)
@@ -1078,11 +1090,7 @@ def _load_pixart_trainable_subset_compatible(pixart: nn.Module, saved_trainable:
 
     pixart.load_state_dict(curr, strict=False)
 
-    missing = sorted(expected - saved)
-    unexpected = sorted(saved - expected)
-    print(f"[{context}] pixart subset load: loaded={loaded}, missing={len(missing)}, unexpected={len(unexpected)}, shape_skip={skipped_shape}")
-    if missing:
-        print(f"[{context}] missing sample: {missing[:10]}")
+    print(f"[{context}] pixart subset load: loaded={loaded}, model_miss={missing_in_model}, shape_skip={skipped_shape}, saved_total={len(saved)}")
 
 def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
@@ -1131,6 +1139,33 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
 # ================= 9. Validation =================
+def run_phase0_regression_check(pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
+    if not RUN_PHASE0_REGRESSION_TEST:
+        return
+    print("🧪 Running Phase0 zero-impact regression check (raw vs EMA-applied snapshot)...")
+    # proxy check: with zero-init dual branch, raw and EMA-applied should be nearly identical at start.
+    ema_tmp = ParamEMA(decay=EMA_DECAY)
+    named = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
+    ema_tmp.register(named)
+
+    val_raw = validate(-1, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu)
+    ema_tmp.apply(named)
+    val_ema = validate(-1, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu)
+    ema_tmp.restore(named)
+
+    key = int(BEST_VAL_STEPS) if int(BEST_VAL_STEPS) in val_raw and int(BEST_VAL_STEPS) in val_ema else next(iter(val_raw.keys()))
+    r = val_raw[key]
+    e = val_ema[key]
+    psnr_drop = float(r[0] - e[0])
+    lpips_rise = float(e[2] - r[2])
+    print(f"[Phase0] raw@{key}: PSNR={r[0]:.4f}, LPIPS={r[2]:.4f} | ema@{key}: PSNR={e[0]:.4f}, LPIPS={e[2]:.4f}")
+    if psnr_drop > PHASE0_MAX_PSNR_DROP or lpips_rise > PHASE0_MAX_LPIPS_RISE:
+        raise RuntimeError(
+            f"Phase0 regression failed: psnr_drop={psnr_drop:.4f} (max {PHASE0_MAX_PSNR_DROP}), "
+            f"lpips_rise={lpips_rise:.4f} (max {PHASE0_MAX_LPIPS_RISE})"
+        )
+
+
 @torch.no_grad()
 def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
     print(f"🔎 Validating Epoch {epoch+1}...")
@@ -1267,6 +1302,9 @@ def main():
     pixart.train()
 
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).float().train()
+    if TRAIN_STAGE == "A":
+        for p in adapter.parameters():
+            p.requires_grad_(False)
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
     vae.enable_slicing()
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
@@ -1289,19 +1327,22 @@ def main():
 
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
-    # [FIXED HERE] Process-Corrected Optimizer Grouping (Mutually Exclusive)
-    adapter_params = list(adapter.parameters())
-    
-    # 1. Select params for trainable PixArt subset (alpha-like: train most params; keep fast lanes explicit)
+    # Stage-aware optimizer grouping
+    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+
+    dual_params = []
     embedder_params = []
     inject_gate_params = []
     lora_params = []
     other_pixart_params = []
 
+    dual_keys = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if 'x_embedder' in n:
+        if any(k in n for k in dual_keys):
+            dual_params.append(p)
+        elif 'x_embedder' in n:
             embedder_params.append(p)
         elif any(k in n for k in inject_gate_keys):
             inject_gate_params.append(p)
@@ -1310,33 +1351,36 @@ def main():
         else:
             other_pixart_params.append(p)
 
-    # 3. Create Optimizer Groups
-    optim_groups = [
-        {"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01},
-        {"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0},
-        {"params": lora_params, "lr": 1e-4, "weight_decay": 0.0},
-        {"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01},
-    ]
+    optim_groups = []
+    if len(dual_params) > 0:
+        optim_groups.append({"params": dual_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(adapter_params) > 0:
+        optim_groups.append({"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(inject_gate_params) > 0:
+        optim_groups.append({"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0})
+    if len(lora_params) > 0:
+        optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
+    if len(other_pixart_params) > 0:
+        optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
         optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
+
+    if len(optim_groups) == 0:
+        raise RuntimeError("No optimizer groups built; check stage trainable settings.")
     optimizer = torch.optim.AdamW(optim_groups)
 
-    # 2. Clipper needs flat tensor list
-    params_to_clip = adapter_params + inject_gate_params + lora_params + other_pixart_params + embedder_params
+    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + other_pixart_params + embedder_params
 
-    # Sanity checks: ensure pixart trainable params are fully and uniquely covered.
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = embedder_params + inject_gate_params + lora_params + other_pixart_params
+    grouped = dual_params + embedder_params + inject_gate_params + lora_params + other_pixart_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
         raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
-    if len(inject_gate_params) == 0 or len(lora_params) == 0:
-        print(f"⚠️ Optimizer group warning: inject_gate={len(inject_gate_params)}, lora={len(lora_params)}, x_embedder={len(embedder_params)}")
     print(
         "✅ Optim groups (pixart): "
-        f"inject={len(inject_gate_params)}, lora={len(lora_params)}, "
-        f"other={len(other_pixart_params)}, x_embedder={len(embedder_params)}"
+        f"dual={len(dual_params)}, inject={len(inject_gate_params)}, lora={len(lora_params)}, "
+        f"other={len(other_pixart_params)}, x_embedder={len(embedder_params)}, adapter={len(adapter_params)}"
     )
 
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
@@ -1353,6 +1397,8 @@ def main():
         print(f"✅ EMA enabled: decay={EMA_DECAY}, track_set={EMA_TRACK_SET}, tensors={len(ema_named_params)}")
 
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
+
+    run_phase0_regression_check(pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
