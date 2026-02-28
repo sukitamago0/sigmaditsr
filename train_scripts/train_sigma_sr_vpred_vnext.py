@@ -4,7 +4,7 @@
 # Fixes included:
 # 1. [Optim] Fixed parameter grouping (Mutually Exclusive).
 # 2. [Process] Unlocked x_embedder learning rate (1e-4).
-# 3. [Process] Disabled LPIPS for structure convergence (Stage 1).
+# 3. [Process] Delayed LPIPS ramp for structure-first convergence (Stage 1).
 # 4. [Structure] Fixed NameError by ensuring Dataset classes are defined.
 # ------------------------------------------------------------------
 
@@ -1270,13 +1270,13 @@ def main():
 
     # 3. Create Optimizer Groups
     optim_groups = [
-        {"params": adapter_params, "lr": 1e-4},
+        {"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01},
         {"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0},
-        {"params": lora_params, "lr": 1e-4},
-        {"params": other_pixart_params, "lr": 1e-5},
+        {"params": lora_params, "lr": 1e-4, "weight_decay": 0.0},
+        {"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01},
     ]
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-4})
+        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
     optimizer = torch.optim.AdamW(optim_groups)
 
     # 2. Clipper needs flat tensor list
@@ -1365,19 +1365,14 @@ def main():
                 sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
                 target_v = alpha_t * noise - sigma_t * zh.float()
                 
-                # [V8 Logic] Min-SNR-Gamma Weighting
-                # SNR = alpha^2 / sigma^2
-                snr = (alpha_t**2) / (sigma_t**2)
-                # Min-SNR-Gamma (gamma=5 is standard for V-pred)
+                # [V8 Logic] Min-SNR-Gamma Weighting (per-sample, shape [B])
+                alpha_s = alpha_t[:, 0, 0, 0]
+                sigma_s = sigma_t[:, 0, 0, 0]
+                snr = (alpha_s ** 2) / (sigma_s ** 2)
                 gamma = 5.0
-                min_snr_gamma = torch.min(snr, torch.tensor(gamma, device=DEVICE))
-                
-                # Loss = MSE(pred_v, target_v) * Min-SNR / SNR (simplified weighting often just min(snr, gamma) / snr_something, but standard implementation is simpler:
-                # For v-prediction, standard MSE is weighted by SNR/(SNR+1) effectively.
-                # Here we use simplified MSE on V directly, which is robust.
-                # Optional: Add Min-SNR weighting:
+                min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
                 loss_weights = min_snr_gamma / snr
-                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.view(-1)).mean()
+                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3]) * loss_weights).mean()
 
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
