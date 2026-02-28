@@ -56,8 +56,6 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
             self.dual_q[key] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
             self.dual_kv[key] = nn.Linear(self.hidden_size, self.hidden_size * 2, bias=True)
             self.dual_out[key] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-            nn.init.zeros_(self.dual_out[key].weight)
-            nn.init.zeros_(self.dual_out[key].bias)
             self.dual_gate[key] = nn.Parameter(torch.zeros(1))
 
     @torch.no_grad()

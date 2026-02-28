@@ -82,6 +82,7 @@ VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
 NULL_T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "null_t5_embed_sigma_300.pth")
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
+INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
 OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
@@ -461,7 +462,8 @@ class ParamEMA:
 def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = "small"):
     names = (
         "adapter_alpha_mlp", "input_adaln", "input_res_proj", "style_fusion_mlp", "input_adapter_ln",
-        "aug_embedder", "injection_scales", "lora_A", "lora_B", "x_embedder"
+        "aug_embedder", "injection_scales", "lora_A", "lora_B", "x_embedder",
+        "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate"
     )
     out = []
     for n, p in adapter.named_parameters():
@@ -1092,6 +1094,34 @@ def _load_pixart_trainable_subset_compatible(pixart: nn.Module, saved_trainable:
 
     print(f"[{context}] pixart subset load: loaded={loaded}, model_miss={missing_in_model}, shape_skip={skipped_shape}, saved_total={len(saved)}")
 
+def _build_limited_val_loader(val_loader, num_samples: int):
+    if num_samples <= 0:
+        return val_loader
+    n = min(num_samples, len(val_loader.dataset))
+    subset = torch.utils.data.Subset(val_loader.dataset, list(range(n)))
+    return DataLoader(subset, batch_size=1, shuffle=False)
+
+
+def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
+    if not ckpt_path:
+        return False
+    if not os.path.exists(ckpt_path):
+        print(f"ℹ️ INIT_CKPT_PATH not found, skip bootstrap: {ckpt_path}")
+        return False
+    print(f"📦 Bootstrapping model weights from {ckpt_path} (weights-only, no optimizer)")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    saved_trainable = ckpt.get("pixart_trainable", {})
+    _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="init")
+    adapter_sd = ckpt.get("adapter", None)
+    if isinstance(adapter_sd, dict):
+        try:
+            adapter.load_state_dict(adapter_sd, strict=True)
+            print("✅ Adapter bootstrap load succeeded.")
+        except Exception as e:
+            print(f"⚠️ Adapter bootstrap load skipped due to mismatch: {e}")
+    return True
+
+
 def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
@@ -1108,7 +1138,10 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
         raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
 
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="resume")
-    optimizer.load_state_dict(ckpt["optimizer"])
+    try:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    except Exception as e:
+        print(f"⚠️ Optimizer state restore skipped due to mismatch: {e}")
     rs = ckpt.get("rng_state", None)
     if rs is not None:
         try:
@@ -1142,23 +1175,27 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
 def run_phase0_regression_check(pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
     if not RUN_PHASE0_REGRESSION_TEST:
         return
-    print("🧪 Running Phase0 zero-impact regression check (raw vs EMA-applied snapshot)...")
-    # proxy check: with zero-init dual branch, raw and EMA-applied should be nearly identical at start.
-    ema_tmp = ParamEMA(decay=EMA_DECAY)
-    named = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
-    ema_tmp.register(named)
+    if not hasattr(pixart, "dualstream_enabled"):
+        print("ℹ️ Phase0 check skipped: model has no dualstream toggle.")
+        return
 
-    val_raw = validate(-1, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu)
-    ema_tmp.apply(named)
-    val_ema = validate(-1, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu)
-    ema_tmp.restore(named)
+    limited_loader = _build_limited_val_loader(val_loader, PHASE0_NUM_SAMPLES)
+    prev_flag = bool(getattr(pixart, "dualstream_enabled"))
 
-    key = int(BEST_VAL_STEPS) if int(BEST_VAL_STEPS) in val_raw and int(BEST_VAL_STEPS) in val_ema else next(iter(val_raw.keys()))
-    r = val_raw[key]
-    e = val_ema[key]
-    psnr_drop = float(r[0] - e[0])
-    lpips_rise = float(e[2] - r[2])
-    print(f"[Phase0] raw@{key}: PSNR={r[0]:.4f}, LPIPS={r[2]:.4f} | ema@{key}: PSNR={e[0]:.4f}, LPIPS={e[2]:.4f}")
+    print(f"🧪 Running Phase0 zero-impact check on {len(limited_loader.dataset)} samples...")
+    pixart.dualstream_enabled = False
+    val_off = validate(-1, pixart, adapter, vae, limited_loader, y_embed, data_info, lpips_fn_val_cpu)
+
+    pixart.dualstream_enabled = True
+    val_on = validate(-1, pixart, adapter, vae, limited_loader, y_embed, data_info, lpips_fn_val_cpu)
+    pixart.dualstream_enabled = prev_flag
+
+    key = int(BEST_VAL_STEPS) if int(BEST_VAL_STEPS) in val_off and int(BEST_VAL_STEPS) in val_on else next(iter(val_off.keys()))
+    a = val_off[key]
+    b = val_on[key]
+    psnr_drop = float(a[0] - b[0])
+    lpips_rise = float(b[2] - a[2])
+    print(f"[Phase0] dual_off@{key}: PSNR={a[0]:.4f}, LPIPS={a[2]:.4f} | dual_on@{key}: PSNR={b[0]:.4f}, LPIPS={b[2]:.4f}")
     if psnr_drop > PHASE0_MAX_PSNR_DROP or lpips_rise > PHASE0_MAX_LPIPS_RISE:
         raise RuntimeError(
             f"Phase0 regression failed: psnr_drop={psnr_drop:.4f} (max {PHASE0_MAX_PSNR_DROP}), "
@@ -1276,7 +1313,6 @@ def main():
     pixart = PixArtSigmaSRDualStream_XL_2(
         input_size=64, in_channels=8, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
-        injection_r_end=INJECT_R_END, injection_s_min=INJECT_S_MIN, injection_s_max=INJECT_S_MAX, injection_init_p=INJECT_INIT_P,
         dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
     ).to(DEVICE)
     base = torch.load(PIXART_PATH, map_location="cpu")
@@ -1395,6 +1431,9 @@ def main():
         ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
         ema.register(ema_named_params)
         print(f"✅ EMA enabled: decay={EMA_DECAY}, track_set={EMA_TRACK_SET}, tensors={len(ema_named_params)}")
+
+    if not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
+        init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
 
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
 
