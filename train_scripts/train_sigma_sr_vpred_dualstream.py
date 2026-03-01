@@ -1038,6 +1038,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     embedder_params = []
     inject_gate_params = []
     lora_params = []
+    final_head_params = []
     other_pixart_params = []
 
     dual_keys = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
@@ -1052,6 +1053,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
             inject_gate_params.append(p)
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
+        elif FINAL_LAYER_KEYWORD in n:
+            final_head_params.append(p)
         else:
             other_pixart_params.append(p)
 
@@ -1064,6 +1067,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
+    if len(final_head_params) > 0:
+        optim_groups.append({"params": final_head_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(other_pixart_params) > 0:
         optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
@@ -1073,10 +1078,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + other_pixart_params + embedder_params
+    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + final_head_params + other_pixart_params + embedder_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = dual_params + embedder_params + inject_gate_params + lora_params + other_pixart_params
+    grouped = dual_params + embedder_params + inject_gate_params + lora_params + final_head_params + other_pixart_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1086,6 +1091,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         "dual": len(dual_params),
         "inject": len(inject_gate_params),
         "lora": len(lora_params),
+        "final_head": len(final_head_params),
         "other": len(other_pixart_params),
         "x_embedder": len(embedder_params),
         "adapter": len(adapter_params),
@@ -1105,7 +1111,8 @@ def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_k
     print(
         "✅ Optim groups (pixart): "
         f"dual={group_counts['dual']}, inject={group_counts['inject']}, lora={group_counts['lora']}, "
-        f"other={group_counts['other']}, x_embedder={group_counts['x_embedder']}, adapter={group_counts['adapter']}"
+        f"final_head={group_counts['final_head']}, other={group_counts['other']}, "
+        f"x_embedder={group_counts['x_embedder']}, adapter={group_counts['adapter']}"
     )
     return optimizer, params_to_clip
 
