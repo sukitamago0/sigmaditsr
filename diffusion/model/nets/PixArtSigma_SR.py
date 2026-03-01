@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
-from diffusion.model.nets.PixArt_blocks import TimestepEmbedder
+from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
@@ -31,7 +31,14 @@ class PixArtSigmaSR(PixArtMS):
         kwargs.setdefault("model_max_length", 300)
         kwargs.setdefault("pred_sigma", False)
         kwargs.setdefault("learn_sigma", False)
+        out_channels = kwargs.pop("out_channels", None)
         super().__init__(**kwargs)
+
+        if out_channels is not None and int(out_channels) != int(self.out_channels):
+            self.out_channels = int(out_channels)
+            self.final_layer = T2IFinalLayer(self.hidden_size, self.patch_size, self.out_channels)
+            nn.init.constant_(self.final_layer.linear.weight, 0)
+            nn.init.constant_(self.final_layer.linear.bias, 0)
         self.depth = len(self.blocks)
         self.hidden_size = self.x_embedder.proj.out_channels
         self.injection_cutoff_layer = injection_cutoff_layer

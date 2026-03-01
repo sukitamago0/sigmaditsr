@@ -54,6 +54,8 @@ V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
+FINAL_LAYER_KEYWORD = "final_layer"
+TRAIN_ADAPTER_IN_STAGE_A = True
 
 def get_required_v7_key_fragments_for_model(model: nn.Module):
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
@@ -939,11 +941,13 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     lora_keywords = ("lora_A", "lora_B")
     inject_gate_keywords = INJECT_GATE_KEYWORDS
 
-    # Stage A: dual-stream + legacy injection path to preserve vnext continuation space
+    # Stage A: dual-stream + legacy injection path + final head to preserve SR alignment
     for n, p in pixart.named_parameters():
         if any(k in n for k in dual_keywords):
             p.requires_grad_(True)
         if any(k in n for k in inject_gate_keywords):
+            p.requires_grad_(True)
+        if FINAL_LAYER_KEYWORD in n:
             p.requires_grad_(True)
 
     if train_stage in ("B", "C"):
@@ -1006,6 +1010,8 @@ def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = Tru
         if any(k in n for k in lora_keywords):
             keep.add(n)
         if any(k in n for k in inject_gate_keywords):
+            keep.add(n)
+        if FINAL_LAYER_KEYWORD in n:
             keep.add(n)
         if n.startswith("blocks."):
             try:
@@ -1090,12 +1096,9 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_keys: set):
     stage = str(stage).upper()
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, train_stage=stage)
-    if stage == "A":
-        for p in adapter.parameters():
-            p.requires_grad_(False)
-    else:
-        for p in adapter.parameters():
-            p.requires_grad_(True)
+    adapter_trainable = (stage != "A") or TRAIN_ADAPTER_IN_STAGE_A
+    for p in adapter.parameters():
+        p.requires_grad_(adapter_trainable)
 
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
@@ -1385,13 +1388,13 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
                     if CFG_SCALE == 1.0:
                         out = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
-                        if out.shape[1] == 8:
-                            out, _ = out.chunk(2, dim=1)
+                        if out.shape[1] != 4:
+                            raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
                     else:
                         out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, injection_mode="hybrid", force_drop_ids=drop_uncond)
                         out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
-                        if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
-                        if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
+                        if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
+                            raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                         out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
             pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
@@ -1447,7 +1450,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
     pixart = PixArtSigmaSRDualStream_XL_2(
-        input_size=64, in_channels=8, sparse_inject_ratio=SPARSE_INJECT_RATIO,
+        input_size=64, in_channels=8, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
         dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
     ).to(DEVICE)
@@ -1578,7 +1581,8 @@ def main():
                 kwargs["force_drop_ids"] = drop_uncond
                 
                 out = pixart(**kwargs)
-                if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
+                if out.shape[1] != 4:
+                    raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
                 model_pred = out.float()
 
                 # [V8 Logic] Calculate V-Target
