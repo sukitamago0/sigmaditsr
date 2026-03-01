@@ -36,7 +36,8 @@ class PixArtSigmaSR(PixArtMS):
 
         if out_channels is not None and int(out_channels) != int(self.out_channels):
             self.out_channels = int(out_channels)
-            self.final_layer = T2IFinalLayer(self.hidden_size, self.patch_size, self.out_channels)
+            head_hidden = self.x_embedder.proj.out_channels
+            self.final_layer = T2IFinalLayer(head_hidden, self.patch_size, self.out_channels)
             nn.init.constant_(self.final_layer.linear.weight, 0)
             nn.init.constant_(self.final_layer.linear.bias, 0)
         self.depth = len(self.blocks)
