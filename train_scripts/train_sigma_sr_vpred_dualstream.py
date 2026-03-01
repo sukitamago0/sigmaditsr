@@ -53,6 +53,7 @@ V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
     "input_adapter_ln", "style_fusion_mlp", "aug_embedder", "injection_scales"
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
+INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 
 def get_required_v7_key_fragments_for_model(model: nn.Module):
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
@@ -936,10 +937,13 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
 
     dual_keywords = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
     lora_keywords = ("lora_A", "lora_B")
+    inject_gate_keywords = INJECT_GATE_KEYWORDS
 
-    # Stage A: new dual-stream path only
+    # Stage A: dual-stream + legacy injection path to preserve vnext continuation space
     for n, p in pixart.named_parameters():
         if any(k in n for k in dual_keywords):
+            p.requires_grad_(True)
+        if any(k in n for k in inject_gate_keywords):
             p.requires_grad_(True)
 
     if train_stage in ("B", "C"):
@@ -992,6 +996,7 @@ def stage_from_progress(global_step: int, default_stage: str = "A"):
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
     dual_keywords = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
     lora_keywords = ("lora_A", "lora_B")
+    inject_gate_keywords = INJECT_GATE_KEYWORDS
     keep = set()
     late_start = int((1.0 - STAGE_C_LATE_BLOCK_FRAC) * len(pixart.blocks))
 
@@ -999,6 +1004,8 @@ def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = Tru
         if any(k in n for k in dual_keywords):
             keep.add(n)
         if any(k in n for k in lora_keywords):
+            keep.add(n)
+        if any(k in n for k in inject_gate_keywords):
             keep.add(n)
         if n.startswith("blocks."):
             try:
@@ -1018,10 +1025,7 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
 
 
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    inject_gate_keys = (
-        "adapter_alpha_mlp", "input_adaln", "input_res_proj",
-        "style_fusion_mlp", "input_adapter_ln", "aug_embedder", "injection_scales"
-    )
+    inject_gate_keys = INJECT_GATE_KEYWORDS
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
 
     dual_params = []
@@ -1147,7 +1151,7 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
     pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
     v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
     lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
-    if TRAIN_STAGE in ("B", "C") and lora_key_count == 0:
+    if str(train_stage).upper() in ("B", "C") and lora_key_count == 0:
         raise RuntimeError("No LoRA keys found in pixart_trainable for stage>=B. Check requires_grad flags.")
     if lora_key_count == 0:
         print("ℹ️ LoRA save check skipped (no trainable LoRA in current stage).")
