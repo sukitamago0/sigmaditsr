@@ -193,6 +193,9 @@ DUAL_NUM_HEADS = 16
 # Staged unfreeze for resume from old checkpoint
 TRAIN_STAGE = "A"  # A: new modules only, B: +LoRA, C: +late blocks
 STAGE_C_LATE_BLOCK_FRAC = 0.25
+AUTO_STAGE_ENABLED = True
+STAGE_B_START_STEP = 20000
+STAGE_C_START_STEP = 60000
 
 # Phase0 safety: check zero-impact regression before training
 RUN_PHASE0_REGRESSION_TEST = False
@@ -975,6 +978,130 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         f"stage={train_stage}, x_embedder_enabled={train_x_embedder}, x_embedder_frozen={x_embedder_frozen}"
     )
 
+
+def stage_from_progress(global_step: int, default_stage: str = "A"):
+    if not AUTO_STAGE_ENABLED:
+        return str(default_stage).upper()
+    if global_step >= STAGE_C_START_STEP:
+        return "C"
+    if global_step >= STAGE_B_START_STEP:
+        return "B"
+    return "A"
+
+
+def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
+    dual_keywords = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
+    lora_keywords = ("lora_A", "lora_B")
+    keep = set()
+    late_start = int((1.0 - STAGE_C_LATE_BLOCK_FRAC) * len(pixart.blocks))
+
+    for n, _ in pixart.named_parameters():
+        if any(k in n for k in dual_keywords):
+            keep.add(n)
+        if any(k in n for k in lora_keywords):
+            keep.add(n)
+        if n.startswith("blocks."):
+            try:
+                lid = int(n.split(".")[1])
+            except Exception:
+                lid = -1
+            if lid >= late_start:
+                keep.add(n)
+        if train_x_embedder and ("x_embedder" in n):
+            keep.add(n)
+    return keep
+
+
+def collect_state_dict_by_keys(model: nn.Module, keys):
+    state = model.state_dict()
+    return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
+
+
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
+    inject_gate_keys = (
+        "adapter_alpha_mlp", "input_adaln", "input_res_proj",
+        "style_fusion_mlp", "input_adapter_ln", "aug_embedder", "injection_scales"
+    )
+    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+
+    dual_params = []
+    embedder_params = []
+    inject_gate_params = []
+    lora_params = []
+    other_pixart_params = []
+
+    dual_keys = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
+    for n, p in pixart.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(k in n for k in dual_keys):
+            dual_params.append(p)
+        elif "x_embedder" in n:
+            embedder_params.append(p)
+        elif any(k in n for k in inject_gate_keys):
+            inject_gate_params.append(p)
+        elif ("lora_A" in n) or ("lora_B" in n):
+            lora_params.append(p)
+        else:
+            other_pixart_params.append(p)
+
+    optim_groups = []
+    if len(dual_params) > 0:
+        optim_groups.append({"params": dual_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(adapter_params) > 0:
+        optim_groups.append({"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(inject_gate_params) > 0:
+        optim_groups.append({"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0})
+    if len(lora_params) > 0:
+        optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
+    if len(other_pixart_params) > 0:
+        optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
+    if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
+        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
+
+    if len(optim_groups) == 0:
+        raise RuntimeError("No optimizer groups built; check stage trainable settings.")
+
+    optimizer = torch.optim.AdamW(optim_groups)
+    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + other_pixart_params + embedder_params
+
+    pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
+    grouped = dual_params + embedder_params + inject_gate_params + lora_params + other_pixart_params
+    if len({id(p) for p in grouped}) != len(grouped):
+        raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
+    if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
+        raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
+
+    group_counts = {
+        "dual": len(dual_params),
+        "inject": len(inject_gate_params),
+        "lora": len(lora_params),
+        "other": len(other_pixart_params),
+        "x_embedder": len(embedder_params),
+        "adapter": len(adapter_params),
+    }
+    return optimizer, params_to_clip, group_counts
+
+
+def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_keys: set):
+    stage = str(stage).upper()
+    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, train_stage=stage)
+    if stage == "A":
+        for p in adapter.parameters():
+            p.requires_grad_(False)
+    else:
+        for p in adapter.parameters():
+            p.requires_grad_(True)
+
+    ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
+    print(
+        "✅ Optim groups (pixart): "
+        f"dual={group_counts['dual']}, inject={group_counts['inject']}, lora={group_counts['lora']}, "
+        f"other={group_counts['other']}, x_embedder={group_counts['x_embedder']}, adapter={group_counts['adapter']}"
+    )
+    return optimizer, params_to_clip
+
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
     if not math.isfinite(psnr_v): return (999, float("inf"))
@@ -997,7 +1124,7 @@ def atomic_torch_save(state, path):
                 except Exception: pass
             return False, f"zip_error={e_zip}; legacy_error={e_old}"
 
-def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen, ema=None):
+def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen, ema=None, keep_keys=None, train_stage="A", stage_schedule=None):
     global BASE_PIXART_SHA256
     psnr_v, ssim_v, lpips_v = metrics; priority, score = should_keep_ckpt(psnr_v, lpips_v)
     current_record = {"path": None, "epoch": epoch, "priority": priority, "score": score, "psnr": psnr_v, "lpips": lpips_v}
@@ -1016,6 +1143,8 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         try: BASE_PIXART_SHA256 = file_sha256(PIXART_PATH)
         except Exception as e: print(f"⚠️ Base PixArt hash failed (non-fatal): {e}"); BASE_PIXART_SHA256 = None
     pixart_sd = collect_trainable_state_dict(pixart); required_frags = get_required_v7_key_fragments_for_model(pixart)
+    keep_keys = set(keep_keys or set())
+    pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
     v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
     lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
     if TRAIN_STAGE in ("B", "C") and lora_key_count == 0:
@@ -1036,8 +1165,10 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         "epoch": epoch, "step": global_step, "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
         "optimizer": optimizer.state_dict(),
         "rng_state": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "numpy": np.random.get_state(), "python": random.getstate()},
-        "dl_gen_state": dl_gen.get_state(), "pixart_trainable": pixart_sd, "best_records": next_best_records, "config_snapshot": get_config_snapshot(), "base_pixart_sha256": BASE_PIXART_SHA256, "env_info": {"torch": torch.__version__, "numpy": np.__version__},
+        "dl_gen_state": dl_gen.get_state(), "pixart_trainable": pixart_sd, "pixart_keep": pixart_keep_sd, "best_records": next_best_records, "config_snapshot": get_config_snapshot(), "base_pixart_sha256": BASE_PIXART_SHA256, "env_info": {"torch": torch.__version__, "numpy": np.__version__},
         "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
+        "train_stage": str(train_stage).upper(),
+        "stage_schedule": dict(stage_schedule or {}),
     }
     last_path = LAST_CKPT_PATH; ok_last, msg_last = atomic_torch_save(state, last_path)
     if ok_last: print(f"💾 Saved last checkpoint to {last_path} [{msg_last}]")
@@ -1110,7 +1241,7 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
         return False
     print(f"📦 Bootstrapping model weights from {ckpt_path} (weights-only, no optimizer)")
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    saved_trainable = ckpt.get("pixart_trainable", {})
+    saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="init")
     adapter_sd = ckpt.get("adapter", None)
     if isinstance(adapter_sd, dict):
@@ -1126,7 +1257,7 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
-    saved_trainable = ckpt.get("pixart_trainable", {})
+    saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
     required_frags = get_required_v7_key_fragments_for_model(pixart)
     missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
     if missing_required:
@@ -1331,17 +1462,13 @@ def main():
         missing, unexpected = pixart.load_state_dict(base, strict=False)
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)}")
     apply_lora(pixart, LORA_RANK, LORA_ALPHA)
-    inject_gate_keys = (
-        "adapter_alpha_mlp", "input_adaln", "input_res_proj",
-        "style_fusion_mlp", "input_adapter_ln", "aug_embedder", "injection_scales"
-    )
-    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, train_stage=TRAIN_STAGE)
     pixart.train()
 
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).float().train()
-    if TRAIN_STAGE == "A":
-        for p in adapter.parameters():
-            p.requires_grad_(False)
+    save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
+    ever_keys = set(save_plan_keys)
+    current_stage = stage_from_progress(0, default_stage=TRAIN_STAGE)
+    optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
     vae.enable_slicing()
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
@@ -1364,61 +1491,7 @@ def main():
 
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
-    # Stage-aware optimizer grouping
-    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
-
-    dual_params = []
-    embedder_params = []
-    inject_gate_params = []
-    lora_params = []
-    other_pixart_params = []
-
-    dual_keys = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
-    for n, p in pixart.named_parameters():
-        if not p.requires_grad:
-            continue
-        if any(k in n for k in dual_keys):
-            dual_params.append(p)
-        elif 'x_embedder' in n:
-            embedder_params.append(p)
-        elif any(k in n for k in inject_gate_keys):
-            inject_gate_params.append(p)
-        elif ('lora_A' in n) or ('lora_B' in n):
-            lora_params.append(p)
-        else:
-            other_pixart_params.append(p)
-
-    optim_groups = []
-    if len(dual_params) > 0:
-        optim_groups.append({"params": dual_params, "lr": 1e-4, "weight_decay": 0.01})
-    if len(adapter_params) > 0:
-        optim_groups.append({"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01})
-    if len(inject_gate_params) > 0:
-        optim_groups.append({"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0})
-    if len(lora_params) > 0:
-        optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
-    if len(other_pixart_params) > 0:
-        optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
-    if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
-
-    if len(optim_groups) == 0:
-        raise RuntimeError("No optimizer groups built; check stage trainable settings.")
-    optimizer = torch.optim.AdamW(optim_groups)
-
-    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + other_pixart_params + embedder_params
-
-    pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = dual_params + embedder_params + inject_gate_params + lora_params + other_pixart_params
-    if len({id(p) for p in grouped}) != len(grouped):
-        raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
-    if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
-        raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
-    print(
-        "✅ Optim groups (pixart): "
-        f"dual={len(dual_params)}, inject={len(inject_gate_params)}, lora={len(lora_params)}, "
-        f"other={len(other_pixart_params)}, x_embedder={len(embedder_params)}, adapter={len(adapter_params)}"
-    )
+    # Stage-aware optimizer is built via apply_stage_switch()
 
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
     # We will manually calculate v_target and loss.
@@ -1438,6 +1511,12 @@ def main():
 
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
 
+    current_stage = stage_from_progress(step, default_stage=TRAIN_STAGE)
+    optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
+    if ema is not None:
+        ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
+        ema.register(ema_named_params)
+
     run_phase0_regression_check(pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
@@ -1453,6 +1532,17 @@ def main():
             if max_steps is not None and step >= max_steps:
                 reached_max_steps = True
                 break
+
+            target_stage = stage_from_progress(step, default_stage=TRAIN_STAGE)
+            if target_stage != current_stage:
+                print(f"🔁 Stage switch: {current_stage} -> {target_stage} @ step={step}")
+                current_stage = target_stage
+                optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
+                optimizer.zero_grad(set_to_none=True)
+                if ema is not None:
+                    ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
+                    ema.register(ema_named_params)
+
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE)
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1612,7 +1702,7 @@ def main():
                       f"ema: PSNR={e[0]:.2f} SSIM={e[1]:.4f} LPIPS={e[2]:.4f}")
 
         metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
-        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen, ema=ema)
+        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen, ema=ema, keep_keys=ever_keys, train_stage=current_stage, stage_schedule={"enabled": AUTO_STAGE_ENABLED, "b_start": STAGE_B_START_STEP, "c_start": STAGE_C_START_STEP})
 
 if __name__ == "__main__":
     main()
