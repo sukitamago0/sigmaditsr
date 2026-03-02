@@ -56,6 +56,7 @@ FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 FINAL_LAYER_KEYWORD = "final_layer"
 TRAIN_ADAPTER_IN_STAGE_A = True
+ENABLE_LORA = False  # True uses LoRA wrappers (not a strict full-unfreeze baseline)
 
 def get_required_v7_key_fragments_for_model(model: nn.Module):
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
@@ -195,11 +196,11 @@ DUAL_CROSS_ATTN_START = 16
 DUAL_NUM_HEADS = 16
 
 # Staged unfreeze for resume from old checkpoint
-TRAIN_STAGE = "A"  # A: new modules only, B: +LoRA, C: +late blocks
-STAGE_C_LATE_BLOCK_FRAC = 0.25
-AUTO_STAGE_ENABLED = True
-STAGE_B_START_STEP = 20000
-STAGE_C_START_STEP = 60000
+TRAIN_STAGE = "C"  # full-unfreeze adapted mode: always C
+STAGE_C_LATE_BLOCK_FRAC = 1.0
+AUTO_STAGE_ENABLED = False
+STAGE_B_START_STEP = 0
+STAGE_C_START_STEP = 0
 
 # Phase0 safety: check zero-impact regression before training
 RUN_PHASE0_REGRESSION_TEST = False
@@ -925,53 +926,20 @@ def apply_lora(model, rank=64, alpha=64):
     print(f"✅ LoRA applied to {cnt} layers.")
 
 
-def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = True, train_stage: str = "A"):
+def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = True, train_stage: str = "C"):
     train_stage = str(train_stage).upper()
-    """Alpha-like policy: keep PixArt params trainable by default, with optional x_embedder freeze.
+    """Full-unfreeze adapted policy for dualstream-from-scratch training.
 
-    LoRA-wrapped base linear weights are still frozen by LoRALinear itself.
+    We keep all PixArt parameters trainable (except optional x_embedder freeze);
+    LoRA base-linear freezing remains controlled by LoRALinear when LoRA is enabled.
     """
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     x_embedder_frozen = 0
 
-    # default freeze policy per stage
-    for n, p in pixart.named_parameters():
-        p.requires_grad_(False)
+    for _, p in pixart.named_parameters():
+        p.requires_grad_(True)
 
-    dual_keywords = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
-    lora_keywords = ("lora_A", "lora_B")
-    inject_gate_keywords = INJECT_GATE_KEYWORDS
-
-    # Stage A: dual-stream + legacy injection path + final head to preserve SR alignment
-    for n, p in pixart.named_parameters():
-        if any(k in n for k in dual_keywords):
-            p.requires_grad_(True)
-        if any(k in n for k in inject_gate_keywords):
-            p.requires_grad_(True)
-        if FINAL_LAYER_KEYWORD in n:
-            p.requires_grad_(True)
-
-    if train_stage in ("B", "C"):
-        for n, p in pixart.named_parameters():
-            if any(k in n for k in lora_keywords):
-                p.requires_grad_(True)
-
-    if train_stage == "C":
-        start = int((1.0 - STAGE_C_LATE_BLOCK_FRAC) * len(pixart.blocks))
-        for n, p in pixart.named_parameters():
-            if n.startswith("blocks."):
-                try:
-                    lid = int(n.split(".")[1])
-                except Exception:
-                    continue
-                if lid >= start:
-                    p.requires_grad_(True)
-
-    if train_x_embedder and train_stage in ("B", "C"):
-        for n, p in pixart.named_parameters():
-            if "x_embedder" in n:
-                p.requires_grad_(True)
-    else:
+    if not train_x_embedder:
         for n, p in pixart.named_parameters():
             if "x_embedder" in n and p.requires_grad:
                 p.requires_grad_(False)
@@ -982,11 +950,10 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
 
     print(
-        "✅ PixArt trainable configured (alpha-like): "
+        "✅ PixArt trainable configured (full-unfreeze adapted): "
         f"before={total_trainable_before}, after={total_trainable_after}, "
         f"stage={train_stage}, x_embedder_enabled={train_x_embedder}, x_embedder_frozen={x_embedder_frozen}"
     )
-
 
 def stage_from_progress(global_step: int, default_stage: str = "A"):
     if not AUTO_STAGE_ENABLED:
@@ -999,30 +966,10 @@ def stage_from_progress(global_step: int, default_stage: str = "A"):
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
-    dual_keywords = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
-    lora_keywords = ("lora_A", "lora_B")
-    inject_gate_keywords = INJECT_GATE_KEYWORDS
-    keep = set()
-    late_start = int((1.0 - STAGE_C_LATE_BLOCK_FRAC) * len(pixart.blocks))
-
-    for n, _ in pixart.named_parameters():
-        if any(k in n for k in dual_keywords):
-            keep.add(n)
-        if any(k in n for k in lora_keywords):
-            keep.add(n)
-        if any(k in n for k in inject_gate_keywords):
-            keep.add(n)
-        if FINAL_LAYER_KEYWORD in n:
-            keep.add(n)
-        if n.startswith("blocks."):
-            try:
-                lid = int(n.split(".")[1])
-            except Exception:
-                lid = -1
-            if lid >= late_start:
-                keep.add(n)
-        if train_x_embedder and ("x_embedder" in n):
-            keep.add(n)
+    # Full-unfreeze run: persist all PixArt parameters for stable resume.
+    keep = {n for n, _ in pixart.named_parameters()}
+    if not train_x_embedder:
+        keep = {n for n in keep if "x_embedder" not in n}
     return keep
 
 
@@ -1073,7 +1020,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     if len(other_pixart_params) > 0:
         optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": embedder_params, "lr": 1e-5, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
@@ -1103,9 +1050,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_keys: set):
     stage = str(stage).upper()
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, train_stage=stage)
-    adapter_trainable = (stage != "A") or TRAIN_ADAPTER_IN_STAGE_A
     for p in adapter.parameters():
-        p.requires_grad_(adapter_trainable)
+        p.requires_grad_(True)
 
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
@@ -1162,10 +1108,10 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
     pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
     v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
     lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
-    if str(train_stage).upper() in ("B", "C") and lora_key_count == 0:
-        raise RuntimeError("No LoRA keys found in pixart_trainable for stage>=B. Check requires_grad flags.")
+    if ENABLE_LORA and lora_key_count == 0:
+        raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
     if lora_key_count == 0:
-        print("ℹ️ LoRA save check skipped (no trainable LoRA in current stage).")
+        print("ℹ️ LoRA save check skipped (LoRA disabled or no trainable LoRA tensors).")
     else:
         print(f"✅ LoRA save check: {lora_key_count} tensors")
     print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
@@ -1476,7 +1422,10 @@ def main():
     else:
         missing, unexpected = pixart.load_state_dict(base, strict=False)
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)}")
-    apply_lora(pixart, LORA_RANK, LORA_ALPHA)
+    if ENABLE_LORA:
+        apply_lora(pixart, LORA_RANK, LORA_ALPHA)
+    else:
+        print("ℹ️ LoRA disabled for strict full-unfreeze run.")
     pixart.train()
 
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).float().train()
