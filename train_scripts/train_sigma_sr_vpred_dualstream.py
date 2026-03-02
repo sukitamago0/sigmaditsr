@@ -56,7 +56,7 @@ FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 FINAL_LAYER_KEYWORD = "final_layer"
 TRAIN_ADAPTER_IN_STAGE_A = True
-ENABLE_LORA = False  # True uses LoRA wrappers (not a strict full-unfreeze baseline)
+ENABLE_LORA = True  # vnext-like mode: enable LoRA while keeping broad PixArt trainability
 
 def get_required_v7_key_fragments_for_model(model: nn.Module):
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
@@ -196,7 +196,7 @@ DUAL_CROSS_ATTN_START = 16
 DUAL_NUM_HEADS = 16
 
 # Staged unfreeze for resume from old checkpoint
-TRAIN_STAGE = "C"  # full-unfreeze adapted mode: always C
+TRAIN_STAGE = "A"  # vnext-like unfreeze policy ignores staged gating
 STAGE_C_LATE_BLOCK_FRAC = 1.0
 AUTO_STAGE_ENABLED = False
 STAGE_B_START_STEP = 0
@@ -1020,7 +1020,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     if len(other_pixart_params) > 0:
         optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-5, "weight_decay": 0.01})
+        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
