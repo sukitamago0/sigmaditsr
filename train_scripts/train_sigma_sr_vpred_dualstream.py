@@ -156,6 +156,7 @@ FORCE_DROP_TEXT = True  # validation-time text drop behavior
 INJECT_SCALE_REG_LAMBDA = 1e-4
 PIXEL_LOSS_T_MAX = 250
 PIXEL_LOSS_START_STEP = WARMUP_STEPS
+LATENT_L1_T_MAX = 400  # apply latent L1 only at lower-noise timesteps
 
 USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
@@ -1610,7 +1611,12 @@ def main():
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
 
-                loss_latent_l1 = F.l1_loss(z0, zh.float())
+                latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
+                latent_l1_mask = (t <= int(LATENT_L1_T_MAX)).float()
+                if float(latent_l1_mask.sum().item()) > 0:
+                    loss_latent_l1 = (latent_l1_per * latent_l1_mask).sum() / latent_l1_mask.sum().clamp_min(1.0)
+                else:
+                    loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
                 w = get_loss_weights(step)
                 
@@ -1681,6 +1687,7 @@ def main():
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
+                    'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'lp': f"{loss_lpips:.3f}",
                     'edge': f"{loss_edge.item():.3f}",
                     'flat_hf': f"{loss_flat_hf.item():.3f}",
