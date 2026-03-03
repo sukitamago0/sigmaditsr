@@ -154,6 +154,16 @@ INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
 COND_DROP_PROB = 0.10
 FORCE_DROP_TEXT = True  # validation-time text drop behavior
+# Phase2: Drop only concat-LR branch (adapter still sees normal/augmented LR)
+CONCAT_LR_DROP_ENABLED = True
+CONCAT_LR_DROP_SCHEDULE = [
+    (0, 0.0),
+    (1000, 0.0),
+    (4000, 0.4),
+    (12000, 0.4),
+    (20000, 0.1),
+]
+CONCAT_LR_DROP_NO_RESCALE = True
 INJECT_SCALE_REG_LAMBDA = 1e-4
 PIXEL_LOSS_T_MAX = 250
 PIXEL_LOSS_START_STEP = WARMUP_STEPS
@@ -249,6 +259,25 @@ def inject_reg_lambda(step: int) -> float:
         p = (step - INJECT_REG_WARMUP_END) / max(1, (INJECT_REG_RAMP_END - INJECT_REG_WARMUP_END))
         return INJECT_SCALE_REG_LAMBDA * (1.0 - p)
     return 0.0
+
+
+def get_concat_lr_drop_p(global_step: int) -> float:
+    if (not CONCAT_LR_DROP_ENABLED) or (CONCAT_LR_DROP_SCHEDULE is None) or (len(CONCAT_LR_DROP_SCHEDULE) == 0):
+        return 0.0
+    s = int(global_step)
+    sched = sorted([(int(k), float(v)) for k, v in CONCAT_LR_DROP_SCHEDULE], key=lambda x: x[0])
+
+    if s <= sched[0][0]:
+        return float(sched[0][1])
+
+    for (a_step, a_p), (b_step, b_p) in zip(sched[:-1], sched[1:]):
+        if a_step <= s <= b_step:
+            if b_step == a_step:
+                return float(b_p)
+            t = (s - a_step) / float(b_step - a_step)
+            return float(a_p + (b_p - a_p) * t)
+
+    return float(sched[-1][1])
 
 
 def sample_t(batch: int, device: str, step: int) -> torch.Tensor:
@@ -1531,12 +1560,20 @@ def main():
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()
                 cond_in = mask_adapter_cond(cond, keep)
 
+            p_cat = get_concat_lr_drop_p(step)
+            zlr_cat = zlr_aug.to(zt.dtype)
+            if CONCAT_LR_DROP_ENABLED and p_cat > 0.0:
+                keep_cat = (torch.rand((zlr_cat.shape[0], 1, 1, 1), device=zlr_cat.device) >= p_cat).to(zlr_cat.dtype)
+                if CONCAT_LR_DROP_NO_RESCALE:
+                    zlr_cat = zlr_cat * keep_cat
+                else:
+                    zlr_cat = zlr_cat * keep_cat / max(1e-6, (1.0 - p_cat))
+
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                # Pass zlr_aug to concat as well (Consistency!)
-                kwargs = dict(x=torch.cat([zt, zlr_aug.to(zt.dtype)], dim=1), timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                kwargs = dict(x=torch.cat([zt, zlr_cat], dim=1), timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
                 kwargs["force_drop_ids"] = drop_uncond
-                
+
                 out = pixart(**kwargs)
                 if out.shape[1] != 4:
                     raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
@@ -1637,6 +1674,7 @@ def main():
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
+                    'p_cat': f"{p_cat:.2f}",
                     'lp': f"{loss_lpips:.3f}",
                     'edge': f"{loss_edge.item():.3f}",
                     'flat_hf': f"{loss_flat_hf.item():.3f}",
