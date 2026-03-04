@@ -23,6 +23,7 @@ class PixArtSigmaSR(PixArtMS):
         injection_s_min: float = 0.1,
         injection_s_max: float = 1.0,
         injection_init_p: float = 2.0,
+        use_csft: bool = True,
         **kwargs,
     ):
         # Root-cause alignment for Sigma->SR adaptation:
@@ -50,6 +51,7 @@ class PixArtSigmaSR(PixArtMS):
         self.injection_layer_to_level = self._build_injection_layer_to_level(self.depth)
         self.register_buffer("injection_depth_decay", self._build_injection_depth_decay(depth=self.depth, r_end=float(injection_r_end)), persistent=True)
         n = len(self.injection_layers)
+        self.use_csft = bool(use_csft)
         self.injection_scales = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(n)])
         self._init_injection_scales(depth=self.depth, s_max=float(injection_s_max), s_min=float(injection_s_min), p=float(injection_init_p))
 
@@ -67,6 +69,14 @@ class PixArtSigmaSR(PixArtMS):
         self.input_adapter_ln = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
         self.input_adaln = nn.ModuleList([nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True) for _ in range(n)])
         self.input_res_proj = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(n)])
+        self.csft_dw = nn.ModuleList([
+            nn.Conv2d(self.hidden_size, self.hidden_size, kernel_size=3, padding=1, groups=self.hidden_size, bias=True)
+            for _ in range(n)
+        ])
+        self.csft_pw = nn.ModuleList([
+            nn.Conv2d(self.hidden_size, self.hidden_size, kernel_size=1, padding=0, bias=True)
+            for _ in range(n)
+        ])
 
         for lin in self.input_adaln:
             nn.init.zeros_(lin.weight)
@@ -74,6 +84,12 @@ class PixArtSigmaSR(PixArtMS):
         for lin in self.input_res_proj:
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
+        for conv in self.csft_dw:
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+        for conv in self.csft_pw:
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
 
     def load_pretrained_weights_with_zero_init(self, state_dict):
         """Shape-aware checkpoint loading for Sigma base -> SR backbone adaptation.
@@ -235,6 +251,8 @@ class PixArtSigmaSR(PixArtMS):
                 feat = adapter_features[i]
                 if feat.shape[-2:] != (self.h, self.w):
                     feat = F.interpolate(feat, size=(self.h, self.w), mode='bilinear', align_corners=False)
+                if self.use_csft:
+                    feat = feat + self.csft_pw[scale_idx](self.csft_dw[scale_idx](feat))
                 feat = feat.flatten(2).transpose(1, 2)
 
                 with torch.cuda.amp.autocast(enabled=False):

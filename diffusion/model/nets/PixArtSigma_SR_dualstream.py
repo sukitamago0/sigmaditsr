@@ -151,6 +151,8 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
                 feat = adapter_features[i]
                 if feat.shape[-2:] != (self.h, self.w):
                     feat = F.interpolate(feat, size=(self.h, self.w), mode='bilinear', align_corners=False)
+                if self.use_csft:
+                    feat = feat + self.csft_pw[scale_idx](self.csft_dw[scale_idx](feat))
                 feat = feat.flatten(2).transpose(1, 2)
 
                 with torch.cuda.amp.autocast(enabled=False):
