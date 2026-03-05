@@ -84,9 +84,14 @@ class PixArtSigmaSR(PixArtMS):
         for lin in self.input_res_proj:
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
+        # CSFT init policy: zero-impact output + non-zero gradient path.
+        # - dw: identity-like init so dw(feat) is non-zero at step0.
+        # - pw: zero init so pw(dw(feat)) == 0 at step0 (behavior-preserving).
         for conv in self.csft_dw:
             nn.init.zeros_(conv.weight)
             nn.init.zeros_(conv.bias)
+            k_h, k_w = conv.kernel_size
+            conv.weight.data[:, :, k_h // 2, k_w // 2] = 1.0
         for conv in self.csft_pw:
             nn.init.zeros_(conv.weight)
             nn.init.zeros_(conv.bias)

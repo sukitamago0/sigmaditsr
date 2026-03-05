@@ -114,7 +114,7 @@ LORA_RANK = 16
 LORA_ALPHA = 16
 TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_embedder
 SPARSE_INJECT_RATIO = 1.0
-INJECTION_CUTOFF_LAYER = 14
+INJECTION_CUTOFF_LAYER = 20
 INJECTION_STRATEGY = "full"
 INJECT_R_END = 0.1
 INJECT_S_MIN = 0.1
@@ -202,7 +202,7 @@ LR_CONSIST_WARMUP = 0
 LR_CONSIST_RAMP = 5000
 
 DUALSTREAM_ENABLED = True
-DUAL_CROSS_ATTN_START = 16
+DUAL_CROSS_ATTN_START = 12
 DUAL_NUM_HEADS = 16
 
 # Staged unfreeze for resume from old checkpoint
@@ -1016,6 +1016,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     inject_gate_params = []
     lora_params = []
     final_head_params = []
+    csft_params = []
     other_pixart_params = []
 
     dual_keys = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate")
@@ -1032,6 +1033,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
             final_head_params.append(p)
+        elif ("csft_dw" in n) or ("csft_pw" in n):
+            csft_params.append(p)
         else:
             other_pixart_params.append(p)
 
@@ -1046,6 +1049,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
     if len(final_head_params) > 0:
         optim_groups.append({"params": final_head_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(csft_params) > 0:
+        optim_groups.append({"params": csft_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(other_pixart_params) > 0:
         optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
@@ -1055,10 +1060,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + final_head_params + other_pixart_params + embedder_params
+    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + final_head_params + csft_params + other_pixart_params + embedder_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = dual_params + embedder_params + inject_gate_params + lora_params + final_head_params + other_pixart_params
+    grouped = dual_params + embedder_params + inject_gate_params + lora_params + final_head_params + csft_params + other_pixart_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1069,6 +1074,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         "inject": len(inject_gate_params),
         "lora": len(lora_params),
         "final_head": len(final_head_params),
+        "csft": len(csft_params),
         "other": len(other_pixart_params),
         "x_embedder": len(embedder_params),
         "adapter": len(adapter_params),
@@ -1437,6 +1443,12 @@ def main():
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
         dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
     ).to(DEVICE)
+    overlap_start = int(max(0, DUAL_CROSS_ATTN_START))
+    overlap_end = int(min(INJECTION_CUTOFF_LAYER - 1, pixart.depth - 1))
+    if overlap_end >= overlap_start:
+        print(f"[Inject×Dual overlap] layers {overlap_start}..{overlap_end}")
+    else:
+        print(f"[Inject×Dual overlap] none (inject< {INJECTION_CUTOFF_LAYER}, dual>= {DUAL_CROSS_ATTN_START})")
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
