@@ -214,13 +214,50 @@ KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 # Staged unfreeze for resume from old checkpoint
 TRAIN_STAGE = "A"  # vnext-like unfreeze policy ignores staged gating
 STAGE_C_LATE_BLOCK_FRAC = 1.0
-AUTO_STAGE_ENABLED = False
+AUTO_STAGE_ENABLED = True
 
 # Selective tuning (structure-prioritized) for 24GB stability and cleaner attribution.
 ENABLE_SELECTIVE_TUNING = True
 TRAINABLE_LAST_BLOCKS = 4
-STAGE_B_START_STEP = 0
-STAGE_C_START_STEP = 0
+TRAINABLE_LAST_BLOCKS_STAGE_B = 12
+STAGE_B_START_STEP = 8000
+STAGE_C_START_STEP = 20000
+
+PHASE_RUNTIME_CFG = {
+    "A": {
+        "cond_aug_noise_range": (0.0, 0.0),
+        "cond_drop_prob": 0.0,
+        "concat_lr_drop_enabled": False,
+        "concat_lr_drop_schedule": [(0, 0.0)],
+        "lr_consist_weight_max": 0.10,
+    },
+    "B": {
+        "cond_aug_noise_range": (0.0, 0.03),
+        "cond_drop_prob": 0.05,
+        "concat_lr_drop_enabled": True,
+        "concat_lr_drop_schedule": [
+            (0, 0.0),
+            (1000, 0.0),
+            (4000, 0.2),
+            (12000, 0.3),
+            (20000, 0.1),
+        ],
+        "lr_consist_weight_max": 0.15,
+    },
+    "C": {
+        "cond_aug_noise_range": (0.0, 0.05),
+        "cond_drop_prob": 0.10,
+        "concat_lr_drop_enabled": True,
+        "concat_lr_drop_schedule": [
+            (0, 0.0),
+            (1000, 0.0),
+            (4000, 0.4),
+            (12000, 0.4),
+            (20000, 0.1),
+        ],
+        "lr_consist_weight_max": 0.20,
+    },
+}
 
 # Phase0 safety: check zero-impact regression before training
 RUN_PHASE0_REGRESSION_TEST = False
@@ -231,7 +268,17 @@ PHASE0_NUM_SAMPLES = 4
 # Keep legacy injection mostly shallow when enabling dual-stream
 
 # ================= 3. Logic Functions =================
-def get_loss_weights(global_step):
+
+
+def get_phase_runtime_cfg(stage: str):
+    stage = str(stage).upper()
+    if stage in PHASE_RUNTIME_CFG:
+        return PHASE_RUNTIME_CFG[stage]
+    return PHASE_RUNTIME_CFG["C"]
+
+def get_loss_weights(global_step, stage: str):
+    runtime_cfg = get_phase_runtime_cfg(stage)
+    lr_consist_weight_max = float(runtime_cfg['lr_consist_weight_max'])
     weights = {'mse': 1.0, 'latent_l1': L1_BASE_WEIGHT}
     if global_step < WARMUP_STEPS:
         weights['lpips'] = 0.0
@@ -256,9 +303,9 @@ def get_loss_weights(global_step):
         weights['lr_cons'] = 0.0
     elif global_step < (LR_CONSIST_WARMUP + LR_CONSIST_RAMP):
         p = (global_step - LR_CONSIST_WARMUP) / max(1, LR_CONSIST_RAMP)
-        weights['lr_cons'] = LR_CONSIST_WEIGHT_MAX * p
+        weights['lr_cons'] = lr_consist_weight_max * p
     else:
-        weights['lr_cons'] = LR_CONSIST_WEIGHT_MAX
+        weights['lr_cons'] = lr_consist_weight_max
     return weights
 
 
@@ -271,11 +318,14 @@ def inject_reg_lambda(step: int) -> float:
     return 0.0
 
 
-def get_concat_lr_drop_p(global_step: int) -> float:
-    if (not CONCAT_LR_DROP_ENABLED) or (CONCAT_LR_DROP_SCHEDULE is None) or (len(CONCAT_LR_DROP_SCHEDULE) == 0):
+def get_concat_lr_drop_p(global_step: int, stage: str) -> float:
+    runtime_cfg = get_phase_runtime_cfg(stage)
+    concat_enabled = bool(runtime_cfg['concat_lr_drop_enabled'])
+    concat_schedule = runtime_cfg['concat_lr_drop_schedule']
+    if (not concat_enabled) or (concat_schedule is None) or (len(concat_schedule) == 0):
         return 0.0
     s = int(global_step)
-    sched = sorted([(int(k), float(v)) for k, v in CONCAT_LR_DROP_SCHEDULE], key=lambda x: x[0])
+    sched = sorted([(int(k), float(v)) for k, v in concat_schedule], key=lambda x: x[0])
 
     if s <= sched[0][0]:
         return float(sched[0][1])
@@ -992,13 +1042,24 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             p.requires_grad_(True)
             enabled += 1
 
-    # Optionally unfreeze a small set of late transformer blocks.
-    if ENABLE_SELECTIVE_TUNING and TRAINABLE_LAST_BLOCKS > 0 and hasattr(pixart, "blocks"):
+    # Stage-wise unfreeze policy (Phase-1/2/3 => A/B/C).
+    trainable_last_blocks = int(TRAINABLE_LAST_BLOCKS)
+    selective_tuning = bool(ENABLE_SELECTIVE_TUNING)
+    if train_stage == "B":
+        trainable_last_blocks = int(TRAINABLE_LAST_BLOCKS_STAGE_B)
+    elif train_stage == "C":
+        selective_tuning = False
+
+    if selective_tuning and trainable_last_blocks > 0 and hasattr(pixart, "blocks"):
         depth = len(pixart.blocks)
-        start_idx = max(0, depth - int(TRAINABLE_LAST_BLOCKS))
+        start_idx = max(0, depth - trainable_last_blocks)
         for i in range(start_idx, depth):
             for _, p in pixart.blocks[i].named_parameters():
                 p.requires_grad_(True)
+
+    if not selective_tuning:
+        for _, p in pixart.named_parameters():
+            p.requires_grad_(True)
 
     x_embedder_frozen = 0
     if not train_x_embedder:
@@ -1011,12 +1072,12 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
 
-    mode = "selective" if ENABLE_SELECTIVE_TUNING else "full"
+    mode = "selective" if selective_tuning else "full"
     print(
         "✅ PixArt trainable configured: "
         f"mode={mode}, before={total_trainable_before}, after={total_trainable_after}, "
         f"stage={train_stage}, x_embedder_enabled={train_x_embedder}, x_embedder_frozen={x_embedder_frozen}, "
-        f"late_blocks={TRAINABLE_LAST_BLOCKS}"
+        f"late_blocks={trainable_last_blocks}"
     )
 
 def stage_from_progress(global_step: int, default_stage: str = "A"):
@@ -1605,9 +1666,12 @@ def main():
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
+            runtime_cfg = get_phase_runtime_cfg(current_stage)
+
             # [V8 Logic] Conditioning Augmentation
             # 1. Sample noise level for LR
-            aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (COND_AUG_NOISE_RANGE[1] - COND_AUG_NOISE_RANGE[0]) + COND_AUG_NOISE_RANGE[0]
+            aug_low, aug_high = runtime_cfg["cond_aug_noise_range"]
+            aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (aug_high - aug_low) + aug_low
             # 2. Add noise to LR
             zlr_aug = zl.float() + torch.randn_like(zl) * aug_noise_level[:, None, None, None]
             # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
@@ -1615,11 +1679,12 @@ def main():
 
             cond = adapter(zlr_aug.float()) # Adapter sees augmented LR
             cond_in = cond
-            if USE_ADAPTER_CFDROPOUT and COND_DROP_PROB > 0:
-                keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()
+            cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
+            if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
+                keep = (torch.rand((zt.shape[0],), device=DEVICE) >= cond_drop_prob).float()
                 cond_in = mask_adapter_cond(cond, keep)
 
-            p_cat = get_concat_lr_drop_p(step)
+            p_cat = get_concat_lr_drop_p(step, current_stage)
             zlr_cat = zlr_aug.to(zt.dtype)
             if CONCAT_LR_DROP_ENABLED and p_cat > 0.0:
                 keep_cat = (torch.rand((zlr_cat.shape[0], 1, 1, 1), device=zlr_cat.device) >= p_cat).to(zlr_cat.dtype)
@@ -1663,7 +1728,7 @@ def main():
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
-                w = get_loss_weights(step)
+                w = get_loss_weights(step, current_stage)
                 
                 # Calculate pixel-space losses
                 loss_edge = torch.tensor(0.0, device=DEVICE)

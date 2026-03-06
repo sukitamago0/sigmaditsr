@@ -56,6 +56,8 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
             self.dual_q[key] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
             self.dual_kv[key] = nn.Linear(self.hidden_size, self.hidden_size * 2, bias=True)
             self.dual_out[key] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+            nn.init.zeros_(self.dual_out[key].weight)
+            nn.init.zeros_(self.dual_out[key].bias)
             self.dual_gate[key] = nn.Parameter(torch.zeros(1))
 
     @torch.no_grad()
@@ -85,7 +87,7 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, n, c)
         attn_out = self.dual_out[k](attn_out)
 
-        gate = torch.sigmoid(self.dual_gate[k]).view(1, 1, 1)
+        gate = torch.tanh(self.dual_gate[k]).view(1, 1, 1)
         return x_tokens + gate * attn_out
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
