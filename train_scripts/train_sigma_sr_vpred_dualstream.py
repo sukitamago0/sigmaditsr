@@ -1293,36 +1293,109 @@ def atomic_torch_save(state, path):
                 except Exception: pass
             return False, f"zip_error={e_zip}; legacy_error={e_old}"
 
-def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen, ema=None, keep_keys=None, train_stage="A", stage_schedule=None):
+def save_smart(
+    epoch,
+    global_step,
+    pixart,
+    adapter,
+    optimizer,
+    best_records,
+    metrics,
+    dl_gen,
+    ema=None,
+    keep_keys=None,
+    train_stage="A",
+    stage_schedule=None,
+    eval_source: str = "raw",
+    eval_steps: int = 50,
+    eval_tag: str = "",
+    export_eval_weights: bool = True,
+    ema_named_params=None,
+):
     global BASE_PIXART_SHA256
-    psnr_v, ssim_v, lpips_v = metrics; priority, score = should_keep_ckpt(psnr_v, lpips_v)
-    current_record = {"path": None, "epoch": epoch, "priority": priority, "score": score, "psnr": psnr_v, "lpips": lpips_v}
+    eval_source = str(eval_source).lower()
+    psnr_v, ssim_v, lpips_v = metrics
+    priority, score = should_keep_ckpt(psnr_v, lpips_v)
+
+    current_record = {
+        "path": None,
+        "epoch": epoch,
+        "priority": priority,
+        "score": score,
+        "psnr": psnr_v,
+        "lpips": lpips_v,
+        "eval_source": eval_source,
+        "eval_steps": int(eval_steps),
+    }
+
     save_as_best = False
-    if len(best_records) < KEEP_TOPK: save_as_best = True
+    if len(best_records) < KEEP_TOPK:
+        save_as_best = True
     else:
         worst_record = best_records[-1]
-        if (priority < worst_record['priority']) or (priority == worst_record['priority'] and score < worst_record['score']): save_as_best = True
+        if (priority < worst_record['priority']) or (priority == worst_record['priority'] and score < worst_record['score']):
+            save_as_best = True
 
-    ckpt_name = None
+    source_tag = eval_source if eval_source in ("raw", "ema") else "raw"
     if save_as_best:
-        ckpt_name = f"epoch{epoch+1:03d}_psnr{psnr_v:.2f}_lp{lpips_v:.4f}.pth"
-        ckpt_path = os.path.join(CKPT_DIR, ckpt_name); current_record['path'] = ckpt_path
+        ckpt_train_name = f"best_train_{source_tag}_epoch{epoch+1:03d}_psnr{psnr_v:.2f}_lp{lpips_v:.4f}.pth"
+        ckpt_train_path = os.path.join(CKPT_DIR, ckpt_train_name)
+        current_record['path'] = ckpt_train_path
+    else:
+        ckpt_train_name = None
+        ckpt_train_path = None
 
     if BASE_PIXART_SHA256 is None and os.path.exists(PIXART_PATH):
-        try: BASE_PIXART_SHA256 = file_sha256(PIXART_PATH)
-        except Exception as e: print(f"⚠️ Base PixArt hash failed (non-fatal): {e}"); BASE_PIXART_SHA256 = None
-    pixart_sd = collect_trainable_state_dict(pixart); required_frags = get_required_v7_key_fragments_for_model(pixart)
+        try:
+            BASE_PIXART_SHA256 = file_sha256(PIXART_PATH)
+        except Exception as e:
+            print(f"⚠️ Base PixArt hash failed (non-fatal): {e}")
+            BASE_PIXART_SHA256 = None
+
     keep_keys = set(keep_keys or set())
-    pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
-    v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
-    lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
-    if ENABLE_LORA and lora_key_count == 0:
-        raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
-    if lora_key_count == 0:
-        print("ℹ️ LoRA save check skipped (LoRA disabled or no trainable LoRA tensors).")
-    else:
-        print(f"✅ LoRA save check: {lora_key_count} tensors")
-    print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
+
+    def _build_state_dict_snapshot(checkpoint_role: str):
+        pixart_sd = collect_trainable_state_dict(pixart)
+        required_frags = get_required_v7_key_fragments_for_model(pixart)
+        v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
+        lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
+        if ENABLE_LORA and lora_key_count == 0:
+            raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
+        if lora_key_count == 0:
+            print("ℹ️ LoRA save check skipped (LoRA disabled or no trainable LoRA tensors).")
+        else:
+            print(f"✅ LoRA save check: {lora_key_count} tensors")
+        print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
+
+        pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
+        state = {
+            "epoch": epoch,
+            "step": global_step,
+            "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+            },
+            "dl_gen_state": dl_gen.get_state(),
+            "pixart_trainable": pixart_sd,
+            "pixart_keep": pixart_keep_sd,
+            "best_records": None,
+            "config_snapshot": get_config_snapshot(),
+            "base_pixart_sha256": BASE_PIXART_SHA256,
+            "env_info": {"torch": torch.__version__, "numpy": np.__version__},
+            "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
+            "train_stage": str(train_stage).upper(),
+            "stage_schedule": dict(stage_schedule or {}),
+            "checkpoint_role": str(checkpoint_role),
+            "best_eval_source": source_tag,
+            "best_eval_steps": int(eval_steps),
+            "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
+            "best_eval_tag": str(eval_tag),
+        }
+        return state
 
     next_best_records = list(best_records)
     if save_as_best:
@@ -1330,34 +1403,49 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         next_best_records.sort(key=lambda x: (x['priority'], x['score']))
         next_best_records = next_best_records[:KEEP_TOPK]
 
-    state = {
-        "epoch": epoch, "step": global_step, "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
-        "optimizer": optimizer.state_dict(),
-        "rng_state": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "numpy": np.random.get_state(), "python": random.getstate()},
-        "dl_gen_state": dl_gen.get_state(), "pixart_trainable": pixart_sd, "pixart_keep": pixart_keep_sd, "best_records": next_best_records, "config_snapshot": get_config_snapshot(), "base_pixart_sha256": BASE_PIXART_SHA256, "env_info": {"torch": torch.__version__, "numpy": np.__version__},
-        "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
-        "train_stage": str(train_stage).upper(),
-        "stage_schedule": dict(stage_schedule or {}),
-    }
-    last_path = LAST_CKPT_PATH; ok_last, msg_last = atomic_torch_save(state, last_path)
-    if ok_last: print(f"💾 Saved last checkpoint to {last_path} [{msg_last}]")
-    else: print(f"❌ Failed to save last.pth: {msg_last}")
+    # Always save full training-state checkpoint for resume
+    state_last = _build_state_dict_snapshot(checkpoint_role="last")
+    state_last["best_records"] = next_best_records
+    last_path = LAST_CKPT_PATH
+    ok_last, msg_last = atomic_torch_save(state_last, last_path)
+    if ok_last:
+        print(f"💾 Saved last checkpoint to {last_path} [{msg_last}]")
+    else:
+        print(f"❌ Failed to save last.pth: {msg_last}")
 
     best_saved = False
-    if save_as_best and current_record["path"]:
-        try:
-            if ok_last and os.path.exists(last_path):
-                shutil.copy2(last_path, current_record["path"]); print(f"🏆 New Best Model! Copied from last.pth to {ckpt_name}")
-                best_saved = True
-            else:
-                ok_best, msg_best = atomic_torch_save(state, current_record["path"])
-                if ok_best:
-                    print(f"🏆 New Best Model! Saved to {ckpt_name} [{msg_best}]")
-                    best_saved = True
+    if save_as_best and ckpt_train_path is not None:
+        # best_train: full training-state archive (resume-capable)
+        state_best_train = _build_state_dict_snapshot(checkpoint_role="best_train")
+        state_best_train["best_records"] = next_best_records
+        ok_train, msg_train = atomic_torch_save(state_best_train, ckpt_train_path)
+        if ok_train:
+            print(f"🏆 New Best Train Ckpt! Saved to {os.path.basename(ckpt_train_path)} [{msg_train}] source={source_tag}")
+            best_saved = True
+        else:
+            print(f"❌ Failed to save best_train checkpoint: {msg_train}")
+
+        # best_eval: direct eval/export snapshot matching chosen eval source
+        if export_eval_weights:
+            ckpt_eval_name = f"best_eval_{source_tag}_epoch{epoch+1:03d}_psnr{psnr_v:.2f}_lp{lpips_v:.4f}.pth"
+            ckpt_eval_path = os.path.join(CKPT_DIR, ckpt_eval_name)
+
+            applied_ema = False
+            try:
+                if source_tag == "ema" and ema is not None and ema_named_params is not None:
+                    ema.apply(ema_named_params)
+                    applied_ema = True
+                state_best_eval = _build_state_dict_snapshot(checkpoint_role="best_eval")
+                state_best_eval["best_records"] = next_best_records
+                # best_eval is for testing/inference; optimizer/rng still kept for traceability but role disambiguates it.
+                ok_eval, msg_eval = atomic_torch_save(state_best_eval, ckpt_eval_path)
+                if ok_eval:
+                    print(f"📦 Exported best_eval checkpoint: {ckpt_eval_name} [{msg_eval}] source={source_tag}")
                 else:
-                    print(f"❌ Failed to save best checkpoint: {msg_best}")
-        except Exception as e:
-            print(f"❌ Failed to save best checkpoint: {e}")
+                    print(f"❌ Failed to save best_eval checkpoint: {msg_eval}")
+            finally:
+                if applied_ema:
+                    ema.restore(ema_named_params)
 
     if best_saved:
         old_paths = {rec.get('path') for rec in best_records if rec.get('path')}
@@ -1366,7 +1454,7 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
             if os.path.exists(stale):
                 try:
                     os.remove(stale)
-                    print(f"🗑️ Removed old best: {os.path.basename(stale)}")
+                    print(f"🗑️ Removed old best_train: {os.path.basename(stale)}")
                 except Exception:
                     pass
         return next_best_records
@@ -1423,9 +1511,16 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
 
 
 def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
-    if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
+    if not os.path.exists(LAST_CKPT_PATH):
+        return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
+    ckpt_role = str(ckpt.get("checkpoint_role", "last"))
+    if ckpt_role not in ("last", "best_train"):
+        raise RuntimeError(
+            f"Checkpoint role '{ckpt_role}' is not resume-capable. "
+            "Use last.pth or best_train_*.pth for resume."
+        )
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
     required_frags = get_required_v7_key_fragments_for_model(pixart)
     missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
@@ -1585,7 +1680,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             del pred_cpu, hr_cpu
 
             if not vis_done:
-                save_path = os.path.join(VIS_DIR, f"epoch{epoch+1:03d}_steps{steps}.png")
+                save_path = os.path.join(VIS_DIR, f"epoch{epoch+1:03d}_{tag}_steps{steps}.png")
                 lr_np = (lr[0].cpu().float().numpy().transpose(1,2,0) + 1) / 2
                 hr_np = (hr[0].cpu().float().numpy().transpose(1,2,0) + 1) / 2
                 pr_np = (pred[0].cpu().float().numpy().transpose(1,2,0) + 1) / 2
@@ -1939,19 +2034,53 @@ def main():
             and (EMA_VALIDATE_EVERY > 0)
             and (validation_count % EMA_VALIDATE_EVERY == 0)
         )
+        val_ema = None
         if run_ema_val:
             print(f"🔎 [VAL] EMA weights (validation #{validation_count})")
             ema.apply(ema_named_params)
             val_ema = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu, val_tag="ema")
             ema.restore(ema_named_params)
-            if int(BEST_VAL_STEPS) in val_raw and int(BEST_VAL_STEPS) in val_ema:
-                r = val_raw[int(BEST_VAL_STEPS)]
-                e = val_ema[int(BEST_VAL_STEPS)]
-                print(f"[VAL-CMP@{BEST_VAL_STEPS}] raw: PSNR={r[0]:.2f} SSIM={r[1]:.4f} LPIPS={r[2]:.4f} | "
-                      f"ema: PSNR={e[0]:.2f} SSIM={e[1]:.4f} LPIPS={e[2]:.4f}")
 
-        metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
-        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen, ema=ema, keep_keys=ever_keys, train_stage=current_stage, stage_schedule={"enabled": AUTO_STAGE_ENABLED, "b_start": STAGE_B_START_STEP, "c_start": STAGE_C_START_STEP})
+        raw_metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
+        best_eval_source_this_round = "raw"
+        best_eval_metrics_this_round = raw_metrics
+
+        if val_ema is not None:
+            ema_metrics = val_ema[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_ema else next(iter(val_ema.values()))
+            r = raw_metrics
+            e = ema_metrics
+            print(f"[VAL-CMP@{BEST_VAL_STEPS}] raw: PSNR={r[0]:.2f} SSIM={r[1]:.4f} LPIPS={r[2]:.4f} | "
+                  f"ema: PSNR={e[0]:.2f} SSIM={e[1]:.4f} LPIPS={e[2]:.4f}")
+            if should_keep_ckpt(e[0], e[2]) < should_keep_ckpt(r[0], r[2]):
+                best_eval_source_this_round = "ema"
+                best_eval_metrics_this_round = ema_metrics
+
+        print(
+            f"[VAL-BEST@{BEST_VAL_STEPS}] source={best_eval_source_this_round} "
+            f"PSNR={best_eval_metrics_this_round[0]:.2f} "
+            f"SSIM={best_eval_metrics_this_round[1]:.4f} "
+            f"LPIPS={best_eval_metrics_this_round[2]:.4f}"
+        )
+
+        best = save_smart(
+            epoch,
+            step,
+            pixart,
+            adapter,
+            optimizer,
+            best,
+            best_eval_metrics_this_round,
+            dl_gen,
+            ema=ema,
+            keep_keys=ever_keys,
+            train_stage=current_stage,
+            stage_schedule={"enabled": AUTO_STAGE_ENABLED, "b_start": STAGE_B_START_STEP, "c_start": STAGE_C_START_STEP},
+            eval_source=best_eval_source_this_round,
+            eval_steps=int(BEST_VAL_STEPS),
+            eval_tag=f"val{validation_count}",
+            export_eval_weights=True,
+            ema_named_params=ema_named_params,
+        )
 
 if __name__ == "__main__":
     main()
