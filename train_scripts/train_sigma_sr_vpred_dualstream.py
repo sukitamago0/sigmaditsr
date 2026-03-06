@@ -205,6 +205,11 @@ DUALSTREAM_ENABLED = True
 DUAL_CROSS_ATTN_START = 12
 DUAL_NUM_HEADS = 16
 
+# Conservative KV-compress to reduce attention memory with minimal quality impact.
+KV_COMPRESS_ENABLE = True
+KV_COMPRESS_SCALE = 2
+KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
+
 # Staged unfreeze for resume from old checkpoint
 TRAIN_STAGE = "A"  # vnext-like unfreeze policy ignores staged gating
 STAGE_C_LATE_BLOCK_FRAC = 1.0
@@ -1438,11 +1443,22 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, drop_last=True, worker_init_fn=seed_worker, generator=dl_gen)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
+    kv_cfg = {
+        "sampling": None,
+        "scale_factor": int(KV_COMPRESS_SCALE),
+        "kv_compress_layer": list(KV_COMPRESS_LAYERS),
+    } if KV_COMPRESS_ENABLE else None
+
     pixart = PixArtSigmaSRDualStream_XL_2(
         input_size=64, in_channels=8, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
         dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
+        kv_compress_config=kv_cfg,
     ).to(DEVICE)
+    if KV_COMPRESS_ENABLE:
+        print(f"[KV-Compress] enabled scale={KV_COMPRESS_SCALE} layers={KV_COMPRESS_LAYERS}")
+    else:
+        print("[KV-Compress] disabled")
     overlap_start = int(max(0, DUAL_CROSS_ATTN_START))
     overlap_end = int(min(INJECTION_CUTOFF_LAYER - 1, pixart.depth - 1))
     if overlap_end >= overlap_start:
