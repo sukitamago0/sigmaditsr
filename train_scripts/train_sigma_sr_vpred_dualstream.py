@@ -114,7 +114,7 @@ LORA_RANK = 16
 LORA_ALPHA = 16
 TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_embedder
 SPARSE_INJECT_RATIO = 1.0
-INJECTION_CUTOFF_LAYER = 20
+INJECTION_CUTOFF_LAYER = 16
 INJECTION_STRATEGY = "full"
 INJECT_R_END = 0.1
 INJECT_S_MIN = 0.1
@@ -202,11 +202,11 @@ LR_CONSIST_WARMUP = 0
 LR_CONSIST_RAMP = 5000
 
 DUALSTREAM_ENABLED = True
-DUAL_CROSS_ATTN_START = 12
+DUAL_CROSS_ATTN_START = 14
 DUAL_NUM_HEADS = 16
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
-KV_COMPRESS_ENABLE = True
+KV_COMPRESS_ENABLE = False
 KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
