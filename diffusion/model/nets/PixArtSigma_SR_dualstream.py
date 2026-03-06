@@ -85,7 +85,7 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, n, c)
         attn_out = self.dual_out[k](attn_out)
 
-        gate = torch.tanh(self.dual_gate[k]).view(1, 1, 1)
+        gate = torch.sigmoid(self.dual_gate[k]).view(1, 1, 1)
         return x_tokens + gate * attn_out
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):

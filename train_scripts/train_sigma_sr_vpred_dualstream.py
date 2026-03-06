@@ -42,6 +42,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR_dualstream import PixArtSigmaSRDualStream_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
@@ -122,7 +123,7 @@ INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
 
 # [V8 Augmentation]
-COND_AUG_NOISE_RANGE = (0.0, 0.05) 
+COND_AUG_NOISE_RANGE = (0.0, 0.0) 
 
 WARMUP_STEPS = 4000         
 RAMP_UP_STEPS = 5000         
@@ -136,7 +137,7 @@ EDGE_POW         = 0.50     # mask sharpening ( <1 boosts weak edges )
 EDGE_WARMUP_STEPS = 3000
 EDGE_RAMP_STEPS = 4000
 
-VAL_STEPS_LIST = [50]
+VAL_STEPS_LIST = [20, 50, 100]
 BEST_VAL_STEPS = 50
 PSNR_SWITCH = 24.0
 KEEP_TOPK = 2
@@ -152,10 +153,10 @@ LQ_INIT_STRENGTH = 0.3
 
 INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
-COND_DROP_PROB = 0.10
+COND_DROP_PROB = 0.0
 FORCE_DROP_TEXT = True  # validation-time text drop behavior
 # Phase2: Drop only concat-LR branch (adapter still sees normal/augmented LR)
-CONCAT_LR_DROP_ENABLED = True
+CONCAT_LR_DROP_ENABLED = False
 CONCAT_LR_DROP_SCHEDULE = [
     (0, 0.0),
     (1000, 0.0),
@@ -186,7 +187,7 @@ RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.Interpol
 USE_EMA = True
 EMA_DECAY = 0.999
 EMA_TRACK_SET = "small"  # small | all
-EMA_VALIDATE = False  # if True, run an extra EMA validation pass each epoch
+EMA_VALIDATE = True  # enable EMA/raw comparison for diagnosis
 
 T_SAMPLE_MODE = "power"   # uniform | power | two_stage
 T_SAMPLE_POWER = 2.5
@@ -197,9 +198,9 @@ T_TWO_STAGE_SWITCH = 15000
 INJECT_REG_WARMUP_END = 2000
 INJECT_REG_RAMP_END = 12000
 
-LR_CONSIST_WEIGHT_MAX = 0.5
+LR_CONSIST_WEIGHT_MAX = 0.1
 LR_CONSIST_WARMUP = 0
-LR_CONSIST_RAMP = 5000
+LR_CONSIST_RAMP = 12000
 
 DUALSTREAM_ENABLED = True
 DUAL_CROSS_ATTN_START = 14
@@ -214,6 +215,10 @@ KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 TRAIN_STAGE = "A"  # vnext-like unfreeze policy ignores staged gating
 STAGE_C_LATE_BLOCK_FRAC = 1.0
 AUTO_STAGE_ENABLED = False
+
+# Selective tuning (structure-prioritized) for 24GB stability and cleaner attribution.
+ENABLE_SELECTIVE_TUNING = True
+TRAINABLE_LAST_BLOCKS = 4
 STAGE_B_START_STEP = 0
 STAGE_C_START_STEP = 0
 
@@ -962,17 +967,40 @@ def apply_lora(model, rank=64, alpha=64):
 
 def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = True, train_stage: str = "C"):
     train_stage = str(train_stage).upper()
-    """Full-unfreeze adapted policy for dualstream-from-scratch training.
-
-    We keep all PixArt parameters trainable (except optional x_embedder freeze);
-    LoRA base-linear freezing remains controlled by LoRALinear when LoRA is enabled.
-    """
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
-    x_embedder_frozen = 0
 
+    # Default: freeze all, then selectively unfreeze task-relevant modules.
     for _, p in pixart.named_parameters():
-        p.requires_grad_(True)
+        p.requires_grad_(False)
 
+    always_train_keywords = [
+        "x_embedder",
+        "final_layer",
+        "input_adaln",
+        "input_res_proj",
+        "adapter_alpha_mlp",
+        "injection_scales",
+        "csft_dw",
+        "csft_pw",
+    ]
+    if ENABLE_LORA:
+        always_train_keywords.extend(["lora_A", "lora_B"])
+
+    enabled = 0
+    for n, p in pixart.named_parameters():
+        if any(k in n for k in always_train_keywords):
+            p.requires_grad_(True)
+            enabled += 1
+
+    # Optionally unfreeze a small set of late transformer blocks.
+    if ENABLE_SELECTIVE_TUNING and TRAINABLE_LAST_BLOCKS > 0 and hasattr(pixart, "blocks"):
+        depth = len(pixart.blocks)
+        start_idx = max(0, depth - int(TRAINABLE_LAST_BLOCKS))
+        for i in range(start_idx, depth):
+            for _, p in pixart.blocks[i].named_parameters():
+                p.requires_grad_(True)
+
+    x_embedder_frozen = 0
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
             if "x_embedder" in n and p.requires_grad:
@@ -983,10 +1011,12 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
 
+    mode = "selective" if ENABLE_SELECTIVE_TUNING else "full"
     print(
-        "✅ PixArt trainable configured (full-unfreeze adapted): "
-        f"before={total_trainable_before}, after={total_trainable_after}, "
-        f"stage={train_stage}, x_embedder_enabled={train_x_embedder}, x_embedder_frozen={x_embedder_frozen}"
+        "✅ PixArt trainable configured: "
+        f"mode={mode}, before={total_trainable_before}, after={total_trainable_after}, "
+        f"stage={train_stage}, x_embedder_enabled={train_x_embedder}, x_embedder_frozen={x_embedder_frozen}, "
+        f"late_blocks={TRAINABLE_LAST_BLOCKS}"
     )
 
 def stage_from_progress(global_step: int, default_stage: str = "A"):
@@ -1455,6 +1485,7 @@ def main():
         dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
+    set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
     if KV_COMPRESS_ENABLE:
         print(f"[KV-Compress] enabled scale={KV_COMPRESS_SCALE} layers={KV_COMPRESS_LAYERS}")
     else:

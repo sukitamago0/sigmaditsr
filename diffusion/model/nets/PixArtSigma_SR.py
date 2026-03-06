@@ -64,7 +64,7 @@ class PixArtSigmaSR(PixArtMS):
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.SiLU(),
             nn.Linear(self.hidden_size, 1),
-            nn.Tanh(),
+            nn.Sigmoid(),
         )
         self.input_adapter_ln = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
         self.input_adaln = nn.ModuleList([nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True) for _ in range(n)])
