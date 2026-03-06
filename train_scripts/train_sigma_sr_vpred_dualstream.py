@@ -203,11 +203,11 @@ LR_CONSIST_WARMUP = 0
 LR_CONSIST_RAMP = 12000
 
 DUALSTREAM_ENABLED = True
-DUAL_CROSS_ATTN_START = 14
+DUAL_CROSS_ATTN_START = 22
 DUAL_NUM_HEADS = 16
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
-KV_COMPRESS_ENABLE = False
+KV_COMPRESS_ENABLE = True
 KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
@@ -229,7 +229,8 @@ PHASE_RUNTIME_CFG = {
         "cond_drop_prob": 0.0,
         "concat_lr_drop_enabled": False,
         "concat_lr_drop_schedule": [(0, 0.0)],
-        "lr_consist_weight_max": 0.10,
+        "lr_consist_weight_max": 0.00,
+        "enable_lpips": False,
     },
     "B": {
         "cond_aug_noise_range": (0.0, 0.03),
@@ -242,7 +243,8 @@ PHASE_RUNTIME_CFG = {
             (12000, 0.3),
             (20000, 0.1),
         ],
-        "lr_consist_weight_max": 0.15,
+        "lr_consist_weight_max": 0.10,
+        "enable_lpips": False,
     },
     "C": {
         "cond_aug_noise_range": (0.0, 0.05),
@@ -255,7 +257,8 @@ PHASE_RUNTIME_CFG = {
             (12000, 0.4),
             (20000, 0.1),
         ],
-        "lr_consist_weight_max": 0.20,
+        "lr_consist_weight_max": 0.15,
+        "enable_lpips": True,
     },
 }
 
@@ -280,7 +283,9 @@ def get_loss_weights(global_step, stage: str):
     runtime_cfg = get_phase_runtime_cfg(stage)
     lr_consist_weight_max = float(runtime_cfg['lr_consist_weight_max'])
     weights = {'mse': 1.0, 'latent_l1': L1_BASE_WEIGHT}
-    if global_step < WARMUP_STEPS:
+    if not bool(runtime_cfg.get("enable_lpips", False)):
+        weights['lpips'] = 0.0
+    elif global_step < WARMUP_STEPS:
         weights['lpips'] = 0.0
     elif global_step < (WARMUP_STEPS + RAMP_UP_STEPS):
         progress = (global_step - WARMUP_STEPS) / RAMP_UP_STEPS
@@ -418,6 +423,38 @@ def edge_guided_losses(pred_m11: torch.Tensor, gt_m11: torch.Tensor, q: float = 
     return loss_edge, loss_flat_hf, m
 # -------------------------------------------------------------------------------
 
+@torch.cuda.amp.autocast(enabled=False)
+def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
+    # 6ch = RGB + Gray + SobelMag + |Laplacian|
+    img01 = (lr_m11.float() + 1.0) * 0.5
+    gray = _to_luma01(lr_m11)
+    kx = _SOBEL_X.to(device=img01.device)
+    ky = _SOBEL_Y.to(device=img01.device)
+    kl = _LAPLACE.to(device=img01.device)
+    gx = F.conv2d(gray, kx, padding=1)
+    gy = F.conv2d(gray, ky, padding=1)
+    sobel_mag = torch.sqrt(gx * gx + gy * gy + 1e-6).clamp(0.0, 1.0)
+    lap_abs = F.conv2d(gray, kl, padding=1).abs().clamp(0.0, 1.0)
+    return torch.cat([img01, gray, sobel_mag, lap_abs], dim=1)
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> torch.Tensor:
+    # Compare downsampled structure (Sobel/Laplacian), replacing low-frequency Y-L1 consistency.
+    pred_lr = F.interpolate(pred_m11.float(), size=lr_m11.shape[-2:], mode='bilinear', align_corners=False)
+    p = _to_luma01(pred_lr)
+    l = _to_luma01(lr_m11.float())
+    kx = _SOBEL_X.to(device=p.device)
+    ky = _SOBEL_Y.to(device=p.device)
+    kl = _LAPLACE.to(device=p.device)
+    pgx = F.conv2d(p, kx, padding=1); pgy = F.conv2d(p, ky, padding=1)
+    lgx = F.conv2d(l, kx, padding=1); lgy = F.conv2d(l, ky, padding=1)
+    pl = F.conv2d(p, kl, padding=1)
+    ll = F.conv2d(l, kl, padding=1)
+    loss_sobel = (pgx - lgx).abs().mean() + (pgy - lgy).abs().mean()
+    loss_lap = (pl - ll).abs().mean()
+    return 0.5 * loss_sobel + 0.5 * loss_lap
+
 def seed_everything(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
@@ -445,38 +482,51 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     return latents.to(dtype=dtype), timesteps[start_index:]
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
-    if cond is None: return None
-    if not torch.is_tensor(keep_mask): keep_mask = torch.tensor(keep_mask)
+    if cond is None:
+        return None
+    if not torch.is_tensor(keep_mask):
+        keep_mask = torch.tensor(keep_mask)
+
     def _find_device_dtype(x):
-        if torch.is_tensor(x): return x.device, x.dtype
+        if torch.is_tensor(x):
+            return x.device, x.dtype
+        if isinstance(x, dict):
+            for v in x.values():
+                found = _find_device_dtype(v)
+                if found is not None:
+                    return found
         if isinstance(x, (list, tuple)):
             for item in x:
                 found = _find_device_dtype(item)
-                if found is not None: return found
+                if found is not None:
+                    return found
         return None
+
     found = _find_device_dtype(cond)
-    if found is None: return cond
+    if found is None:
+        return cond
+
     dev, _ = found
     keep_mask = keep_mask.to(device=dev, dtype=torch.float32)
-    def _mask(x: torch.Tensor):
+
+    def _mask_tensor(x: torch.Tensor):
         m = keep_mask
-        while m.ndim < x.ndim: m = m.unsqueeze(-1)
+        while m.ndim < x.ndim:
+            m = m.unsqueeze(-1)
         return x * m.to(dtype=x.dtype)
-    if torch.is_tensor(cond): return _mask(cond)
-    if isinstance(cond, dict):
-        return {k: (_mask(v) if torch.is_tensor(v) else v) for k, v in cond.items()}
-    if isinstance(cond, (list, tuple)):
-        if len(cond) == 2 and isinstance(cond[0], list) and torch.is_tensor(cond[1]):
-            spatial = [_mask(c) for c in cond[0]]
-            style = _mask(cond[1])
-            return (spatial, style)
-        masked = []
-        for c in cond:
-            if torch.is_tensor(c): masked.append(_mask(c))
-            elif isinstance(c, list): masked.append([_mask(ci) if torch.is_tensor(ci) else ci for ci in c])
-            else: masked.append(c)
-        return masked if isinstance(cond, list) else tuple(masked)
-    return cond
+
+    def _mask_obj(x):
+        if torch.is_tensor(x):
+            return _mask_tensor(x)
+        if isinstance(x, dict):
+            return {k: _mask_obj(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [_mask_obj(v) for v in x]
+        if isinstance(x, tuple):
+            return tuple(_mask_obj(v) for v in x)
+        return x
+
+    return _mask_obj(cond)
 
 def file_sha256(path):
     sha = hashlib.sha256()
@@ -1460,7 +1510,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
             
-            cond = adapter(z_lr.float())
+            adapter_in = build_adapter_struct_input(lr)
+            cond = adapter(adapter_in)
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
@@ -1577,7 +1628,7 @@ def main():
         print("ℹ️ LoRA disabled for strict full-unfreeze run.")
     pixart.train()
 
-    adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).float().train()
+    adapter = build_adapter_v7(in_channels=6, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).float().train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
     current_stage = stage_from_progress(0, default_stage=TRAIN_STAGE)
@@ -1677,7 +1728,8 @@ def main():
             # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = (aug_noise_level * 1000.0).float()
 
-            cond = adapter(zlr_aug.float()) # Adapter sees augmented LR
+            adapter_in = build_adapter_struct_input(lr)
+            cond = adapter(adapter_in) # Adapter sees image-domain structure guidance
             cond_in = cond
             cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
@@ -1686,7 +1738,7 @@ def main():
 
             p_cat = get_concat_lr_drop_p(step, current_stage)
             zlr_cat = zlr_aug.to(zt.dtype)
-            if CONCAT_LR_DROP_ENABLED and p_cat > 0.0:
+            if runtime_cfg["concat_lr_drop_enabled"] and p_cat > 0.0:
                 keep_cat = (torch.rand((zlr_cat.shape[0], 1, 1, 1), device=zlr_cat.device) >= p_cat).to(zlr_cat.dtype)
                 if CONCAT_LR_DROP_NO_RESCALE:
                     zlr_cat = zlr_cat * keep_cat
@@ -1765,11 +1817,7 @@ def main():
 
                     if w.get('lr_cons', 0.0) > 0:
                         lr_patch = lr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
-                        pred_ds = F.interpolate(img_p_valid, size=(64, 64), mode='bicubic', align_corners=False)
-                        lr_ds = F.interpolate(lr_patch, size=(64, 64), mode='bicubic', align_corners=False)
-                        py_ds = rgb01_to_y01((pred_ds + 1.0) * 0.5)
-                        ly_ds = rgb01_to_y01((lr_ds + 1.0) * 0.5)
-                        loss_lr_cons = F.l1_loss(py_ds, ly_ds)
+                        loss_lr_cons = structure_consistency_loss(img_p_valid, lr_patch)
 
                 inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
                 loss = (

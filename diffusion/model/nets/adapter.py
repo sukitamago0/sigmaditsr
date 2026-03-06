@@ -43,32 +43,63 @@ class StyleExtractor(nn.Module):
 
 
 class MultiLevelAdapterV7(nn.Module):
-    """v7 adapter: dynamic per-layer feature dispenser + global style vector."""
+    """v8 adapter: dual-branch (RGB + structure) with per-layer feat/gate heads."""
 
-    def __init__(self, in_channels: int = 4, hidden_size: int = 1152, base_channels: int = 128, injection_layers_map=None):
+    def __init__(self, in_channels: int = 6, hidden_size: int = 1152, base_channels: int = 128, injection_layers_map=None):
         super().__init__()
-        self.style_extractor = StyleExtractor(in_channels, hidden_size)
+        if in_channels < 6:
+            raise ValueError(f"Expected at least 6 adapter input channels (rgb+gray/sobel/lap), got {in_channels}")
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+        self.style_extractor = StyleExtractor(in_channels, hidden_size)
+        c_half = base_channels // 2
+
+        self.rgb_stem = nn.Sequential(
+            nn.Conv2d(3, c_half, 3, padding=1),
+            ResBlock(c_half),
+            ResBlock(c_half),
+        )
+        self.struct_stem = nn.Sequential(
+            nn.Conv2d(3, c_half, 3, padding=1),
+            ResBlock(c_half),
+            ResBlock(c_half),
+        )
+        self.fuse0 = nn.Sequential(nn.Conv2d(base_channels, base_channels, 1), nn.SiLU())
+
+        self.rgb_body1 = nn.Sequential(
+            nn.Conv2d(c_half, base_channels, 3, stride=2, padding=1),
             ResBlock(base_channels),
             ResBlock(base_channels),
         )
-        self.body1 = nn.Sequential(
+        self.struct_body1 = nn.Sequential(
+            nn.Conv2d(c_half, base_channels, 3, stride=2, padding=1),
+            ResBlock(base_channels),
+            ResBlock(base_channels),
+        )
+        self.fuse1 = nn.Sequential(nn.Conv2d(base_channels * 2, base_channels * 2, 1), nn.SiLU())
+
+        self.rgb_body2 = nn.Sequential(
             nn.Conv2d(base_channels, base_channels * 2, 3, stride=2, padding=1),
             ResBlock(base_channels * 2),
             ResBlock(base_channels * 2),
         )
-        self.body2 = nn.Sequential(
+        self.struct_body2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels * 2, 3, stride=2, padding=1),
+            ResBlock(base_channels * 2),
+            ResBlock(base_channels * 2),
+        )
+        self.fuse2 = nn.Sequential(nn.Conv2d(base_channels * 4, base_channels * 4, 1), nn.SiLU())
+
+        self.rgb_body3 = nn.Sequential(
             nn.Conv2d(base_channels * 2, base_channels * 4, 3, stride=2, padding=1),
             ResBlock(base_channels * 4),
             ResBlock(base_channels * 4),
         )
-        self.body3 = nn.Sequential(
-            nn.Conv2d(base_channels * 4, base_channels * 8, 3, stride=2, padding=1),
-            ResBlock(base_channels * 8),
-            ResBlock(base_channels * 8),
+        self.struct_body3 = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels * 4, 3, stride=2, padding=1),
+            ResBlock(base_channels * 4),
+            ResBlock(base_channels * 4),
         )
+        self.fuse3 = nn.Sequential(nn.Conv2d(base_channels * 8, base_channels * 8, 1), nn.SiLU())
 
         self.lat0 = nn.Conv2d(base_channels, base_channels, 1)
         self.lat1 = nn.Conv2d(base_channels * 2, base_channels, 1)
@@ -81,6 +112,7 @@ class MultiLevelAdapterV7(nn.Module):
         self.refine3 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
 
         self.heads = nn.ModuleDict()
+        self.gate_heads = nn.ModuleDict()
         self.layer_to_level = {}
         if isinstance(injection_layers_map, dict):
             self.injection_layers_map = sorted([int(k) for k in injection_layers_map.keys()])
@@ -111,6 +143,15 @@ class MultiLevelAdapterV7(nn.Module):
             nn.init.zeros_(head[-1].bias)
             self.heads[str(lid)] = head
 
+            gate_head = nn.Sequential(
+                nn.Conv2d(base_channels, base_channels // 2, 3, stride=stride, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(base_channels // 2, 1, 1),
+            )
+            nn.init.zeros_(gate_head[-1].weight)
+            nn.init.zeros_(gate_head[-1].bias)
+            self.gate_heads[str(lid)] = gate_head
+
     def _fpn(self, f0, f1, f2, f3):
         p3 = self.lat3(f3)
         p2 = self.lat2(f2) + F.interpolate(p3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
@@ -123,16 +164,33 @@ class MultiLevelAdapterV7(nn.Module):
         return p0, p1, p2, p3
 
     def forward(self, x: torch.Tensor):
+        rgb = x[:, :3]
+        struct = x[:, 3:6]
+
         style_vec = self.style_extractor(x)
-        f0 = self.stem(x)
-        f1 = self.body1(f0)
-        f2 = self.body2(f1)
-        f3 = self.body3(f2)
+
+        r0 = self.rgb_stem(rgb)
+        s0 = self.struct_stem(struct)
+        f0 = self.fuse0(torch.cat([r0, s0], dim=1))
+
+        r1 = self.rgb_body1(r0)
+        s1 = self.struct_body1(s0)
+        f1 = self.fuse1(torch.cat([r1, s1], dim=1))
+
+        r2 = self.rgb_body2(r1)
+        s2 = self.struct_body2(s1)
+        f2 = self.fuse2(torch.cat([r2, s2], dim=1))
+
+        r3 = self.rgb_body3(r2)
+        s3 = self.struct_body3(s2)
+        f3 = self.fuse3(torch.cat([r3, s3], dim=1))
+
         p0, p1, p2, p3 = self._fpn(f0, f1, f2, f3)
         pyramid = {0: p0, 1: p1, 2: p2, 3: p3}
         target_size = p1.shape[-2:]
 
         outputs = {}
+        gates = {}
         for layer_str, head in self.heads.items():
             layer_id = int(layer_str)
             lvl = self.layer_to_level[layer_id]
@@ -140,11 +198,12 @@ class MultiLevelAdapterV7(nn.Module):
             if lvl > 1 and feat.shape[-2:] != target_size:
                 feat = F.interpolate(feat, size=target_size, mode="bilinear", align_corners=False)
             outputs[layer_id] = head(feat)
+            gates[layer_id] = torch.sigmoid(self.gate_heads[layer_str](feat))
 
-        return outputs, style_vec
+        return outputs, style_vec, gates
 
 
-def build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=None):
+def build_adapter_v7(in_channels=6, hidden_size=1152, injection_layers_map=None):
     return MultiLevelAdapterV7(
         in_channels=in_channels,
         hidden_size=hidden_size,

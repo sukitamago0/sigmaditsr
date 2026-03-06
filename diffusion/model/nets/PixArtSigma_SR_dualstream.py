@@ -123,9 +123,13 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         adapter_features = {}
+        adapter_gates = {}
         style_vec = None
-        if adapter_cond is not None and isinstance(adapter_cond, (tuple, list)) and len(adapter_cond) == 2:
-            adapter_features, style_vec = adapter_cond
+        if adapter_cond is not None and isinstance(adapter_cond, (tuple, list)):
+            if len(adapter_cond) == 2:
+                adapter_features, style_vec = adapter_cond
+            elif len(adapter_cond) >= 3:
+                adapter_features, style_vec, adapter_gates = adapter_cond[:3]
 
         if style_vec is not None:
             t = t + self.style_fusion_mlp(style_vec.to(self.dtype))
@@ -155,12 +159,27 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
                     feat = F.interpolate(feat, size=(self.h, self.w), mode='bilinear', align_corners=False)
                 if self.use_csft:
                     feat = feat + self.csft_pw[scale_idx](self.csft_dw[scale_idx](feat))
+                gate = adapter_gates.get(i, None) if isinstance(adapter_gates, dict) else None
+                if gate is not None:
+                    if gate.shape[-2:] != (self.h, self.w):
+                        gate = F.interpolate(gate, size=(self.h, self.w), mode='bilinear', align_corners=False)
+                    if gate.shape[1] != 1:
+                        gate = gate.mean(dim=1, keepdim=True)
+                    gate = gate.clamp(0.0, 1.0)
+
                 feat = feat.flatten(2).transpose(1, 2)
 
                 with torch.cuda.amp.autocast(enabled=False):
                     feat = self.input_adapter_ln(feat.float())
                     adaln_shift, adaln_scale = self.input_adaln[scale_idx](feat).chunk(2, dim=-1)
                 res = self.input_res_proj[scale_idx](feat)
+
+                if gate is not None:
+                    gate_tokens = gate.flatten(2).transpose(1, 2).to(feat.dtype)
+                    adaln_shift = adaln_shift * gate_tokens
+                    adaln_scale = adaln_scale * gate_tokens
+                    res = res * gate_tokens
+
                 layer_decay = self.injection_depth_decay[i].to(device=alpha.device, dtype=alpha.dtype).view(1, 1, 1)
                 layer_alpha = F.softplus(self.injection_scales[scale_idx]) * layer_decay * alpha
                 x_tokens = x_tokens + layer_alpha * res.to(x_tokens.dtype)
