@@ -24,6 +24,7 @@ class PixArtSigmaSR(PixArtMS):
         injection_s_max: float = 1.0,
         injection_init_p: float = 2.0,
         use_csft: bool = True,
+        use_style_fusion: bool = False,
         **kwargs,
     ):
         # Root-cause alignment for Sigma->SR adaptation:
@@ -52,6 +53,7 @@ class PixArtSigmaSR(PixArtMS):
         self.register_buffer("injection_depth_decay", self._build_injection_depth_decay(depth=self.depth, r_end=float(injection_r_end)), persistent=True)
         n = len(self.injection_layers)
         self.use_csft = bool(use_csft)
+        self.use_style_fusion = bool(use_style_fusion)
         self.injection_scales = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(n)])
         self._init_injection_scales(depth=self.depth, s_max=float(injection_s_max), s_min=float(injection_s_min), p=float(injection_init_p))
 
@@ -234,7 +236,7 @@ class PixArtSigmaSR(PixArtMS):
             elif len(adapter_cond) >= 3:
                 adapter_features, style_vec, adapter_gates = adapter_cond[:3]
 
-        if style_vec is not None:
+        if style_vec is not None and self.use_style_fusion:
             t = t + self.style_fusion_mlp(style_vec.to(self.dtype))
 
         t0 = self.t_block(t)
@@ -254,6 +256,7 @@ class PixArtSigmaSR(PixArtMS):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         alpha = self.adapter_alpha_mlp(t).view(-1, 1, 1)
+        self._last_adapter_alpha = alpha.detach()
         for i, block in enumerate(self.blocks):
             if i in adapter_features and i in self.injection_layers and i < self.injection_cutoff_layer:
                 scale_idx = self.injection_layers.index(i)

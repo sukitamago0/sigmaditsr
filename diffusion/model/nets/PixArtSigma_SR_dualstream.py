@@ -87,7 +87,7 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, n, c)
         attn_out = self.dual_out[k](attn_out)
 
-        gate = torch.tanh(self.dual_gate[k]).view(1, 1, 1)
+        gate = torch.sigmoid(self.dual_gate[k]).view(1, 1, 1)
         return x_tokens + gate * attn_out
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
@@ -131,7 +131,7 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
             elif len(adapter_cond) >= 3:
                 adapter_features, style_vec, adapter_gates = adapter_cond[:3]
 
-        if style_vec is not None:
+        if style_vec is not None and self.use_style_fusion:
             t = t + self.style_fusion_mlp(style_vec.to(self.dtype))
 
         t0 = self.t_block(t)
@@ -151,6 +151,7 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
             y = y.squeeze(1).view(1, -1, x_tokens.shape[-1])
 
         alpha = self.adapter_alpha_mlp(t).view(-1, 1, 1)
+        self._last_adapter_alpha = alpha.detach()
         for i, block in enumerate(self.blocks):
             if i in adapter_features and i in self.injection_layers and i < self.injection_cutoff_layer:
                 scale_idx = self.injection_layers.index(i)

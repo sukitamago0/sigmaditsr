@@ -205,6 +205,7 @@ LR_CONSIST_RAMP = 12000
 DUALSTREAM_ENABLED = True
 DUAL_CROSS_ATTN_START = 22
 DUAL_NUM_HEADS = 16
+USE_STYLE_FUSION = False
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
 KV_COMPRESS_ENABLE = True
@@ -220,6 +221,7 @@ AUTO_STAGE_ENABLED = True
 ENABLE_SELECTIVE_TUNING = True
 TRAINABLE_LAST_BLOCKS = 4
 TRAINABLE_LAST_BLOCKS_STAGE_B = 12
+TRAINABLE_LAST_BLOCKS_STAGE_C = 8
 STAGE_B_START_STEP = 8000
 STAGE_C_START_STEP = 20000
 
@@ -454,6 +456,33 @@ def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> 
     loss_sobel = (pgx - lgx).abs().mean() + (pgy - lgy).abs().mean()
     loss_lap = (pl - ll).abs().mean()
     return 0.5 * loss_sobel + 0.5 * loss_lap
+
+
+def _extract_adapter_cond_stats(cond):
+    gate_mean = 0.0
+    gate_std = 0.0
+    if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
+        vals = []
+        for v in cond[2].values():
+            if torch.is_tensor(v):
+                vals.append(v.detach().float().reshape(v.shape[0], -1).mean(dim=1))
+        if len(vals) > 0:
+            gm = torch.stack(vals, dim=0).mean(dim=0)
+            gate_mean = float(gm.mean().item())
+            gate_std = float(gm.std(unbiased=False).item()) if gm.numel() > 1 else 0.0
+    return gate_mean, gate_std
+
+
+def _extract_dual_gate_stats(pixart: nn.Module):
+    if not hasattr(pixart, "dual_gate"):
+        return 0.0, 0.0
+    gs = []
+    for _, p in pixart.dual_gate.items():
+        gs.append(torch.sigmoid(p.detach().float().view(-1)))
+    if len(gs) == 0:
+        return 0.0, 0.0
+    g = torch.cat(gs, dim=0)
+    return float(g.mean().item()), float(g.std(unbiased=False).item()) if g.numel() > 1 else 0.0
 
 def seed_everything(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -1098,7 +1127,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     if train_stage == "B":
         trainable_last_blocks = int(TRAINABLE_LAST_BLOCKS_STAGE_B)
     elif train_stage == "C":
-        selective_tuning = False
+        trainable_last_blocks = int(TRAINABLE_LAST_BLOCKS_STAGE_C)
 
     if selective_tuning and trainable_last_blocks > 0 and hasattr(pixart, "blocks"):
         depth = len(pixart.blocks)
@@ -1106,10 +1135,6 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         for i in range(start_idx, depth):
             for _, p in pixart.blocks[i].named_parameters():
                 p.requires_grad_(True)
-
-    if not selective_tuning:
-        for _, p in pixart.named_parameters():
-            p.requires_grad_(True)
 
     x_embedder_frozen = 0
     if not train_x_embedder:
@@ -1502,6 +1527,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
     for steps in steps_list:
         scheduler.set_timesteps(steps, device=DEVICE)
         psnrs, ssims, lpipss = [], [], []; vis_done = False
+        cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1522,15 +1548,25 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     lr_ref = z_lr.to(COMPUTE_DTYPE)
                     model_in = torch.cat([latents.to(COMPUTE_DTYPE), lr_ref], dim=1)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, injection_mode="hybrid", force_drop_ids=drop_uncond)
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
+                    if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
+                        raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
+                    cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
+
+                    a = getattr(pixart, "_last_adapter_alpha", None)
+                    if torch.is_tensor(a):
+                        a = a.detach().float().reshape(a.shape[0], -1)
+                        alpha_means.append(float(a.mean().item()))
+                        alpha_stds.append(float(a.std(unbiased=False).item()) if a.numel() > 1 else 0.0)
+
+                    gm, gs = _extract_adapter_cond_stats(cond)
+                    gate_means.append(gm)
+                    gate_stds.append(gs)
+
                     if CFG_SCALE == 1.0:
-                        out = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
-                        if out.shape[1] != 4:
-                            raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
+                        out = out_cond
                     else:
-                        out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, injection_mode="hybrid", force_drop_ids=drop_uncond)
-                        out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
-                        if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
-                            raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                         out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
             pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
@@ -1557,7 +1593,14 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             if FAST_DEV_RUN and len(psnrs) >= FAST_VAL_BATCHES: break
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
         results[int(steps)] = res
-        print(f"[VAL@{steps}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f}")
+        dual_m, dual_s = _extract_dual_gate_stats(pixart)
+        cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
+        am = float(np.mean(alpha_means)) if len(alpha_means) > 0 else 0.0
+        ast = float(np.mean(alpha_stds)) if len(alpha_stds) > 0 else 0.0
+        gm = float(np.mean(gate_means)) if len(gate_means) > 0 else 0.0
+        gs = float(np.mean(gate_stds)) if len(gate_stds) > 0 else 0.0
+        print(f"[VAL@{steps}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
+              f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | dual_gate={dual_m:.4f}±{dual_s:.4f}")
     pixart.train(); adapter.train()
     return results
 
@@ -1595,6 +1638,7 @@ def main():
         input_size=64, in_channels=8, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
         dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
+        use_style_fusion=USE_STYLE_FUSION,
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
@@ -1842,6 +1886,10 @@ def main():
                 accum_micro_steps = 0
 
             if i % 10 == 0:
+                a = getattr(pixart, "_last_adapter_alpha", None)
+                alpha_mean = float(a.detach().float().mean().item()) if torch.is_tensor(a) else 0.0
+                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
+                dual_gate_mean, _ = _extract_dual_gate_stats(pixart)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -1855,6 +1903,9 @@ def main():
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
+                    'alpha': f"{alpha_mean:.3f}",
+                    'gate': f"{gate_mean:.3f}",
+                    'd_gate': f"{dual_gate_mean:.3f}",
                 })
 
         if accum_micro_steps > 0 and not reached_max_steps:
