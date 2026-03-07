@@ -4,7 +4,7 @@
 # Fixes included:
 # 1. [Optim] Fixed parameter grouping (Mutually Exclusive).
 # 2. [Process] Unlocked x_embedder learning rate (1e-4).
-# 3. [Process] Disabled LPIPS for structure convergence (Stage 1).
+# 3. [Process] Delayed LPIPS ramp for structure-first convergence (Stage 1).
 # 4. [Structure] Fixed NameError by ensuring Dataset classes are defined.
 # ------------------------------------------------------------------
 
@@ -82,7 +82,7 @@ VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
 NULL_T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "null_t5_embed_sigma_300.pth")
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_vnext")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -114,13 +114,17 @@ INJECTION_STRATEGY = "three_stage_sr"
 HARD_INJECTION_LAYERS = list(range(4, 12))
 TRANSITION_INJECTION_LAYERS = list(range(12, 18))
 DETAIL_INJECTION_LAYERS = list(range(20, 28))
+INJECT_R_END = 0.6
+INJECT_S_MIN = 0.3
+INJECT_S_MAX = 1.0
+INJECT_INIT_P = 2.0
 
 # [V8 Augmentation]
 COND_AUG_NOISE_RANGE = (0.0, 0.05) 
 
 WARMUP_STEPS = 4000         
 RAMP_UP_STEPS = 5000         
-TARGET_LPIPS_WEIGHT = 0.50
+TARGET_LPIPS_WEIGHT = 0.15
 LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 1.0
 EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
@@ -152,7 +156,7 @@ INJECT_SCALE_REG_LAMBDA = 1e-4
 PIXEL_LOSS_T_MAX = 250
 PIXEL_LOSS_START_STEP = WARMUP_STEPS
 
-USE_LR_CONSISTENCY = False 
+USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
 
 VAE_TILING = False
@@ -163,6 +167,25 @@ NOISE_RANGE = (0.0, 0.05)
 BLUR_KERNELS = [7, 9, 11, 13, 15, 21]
 JPEG_QUALITY_RANGE = (30, 95)
 RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.InterpolationMode.BILINEAR, transforms.InterpolationMode.BICUBIC]
+
+
+# VNext training controls (script-versioned, no ENV override)
+USE_EMA = True
+EMA_DECAY = 0.999
+EMA_TRACK_SET = "small"  # small | all
+
+T_SAMPLE_MODE = "power"   # uniform | power | two_stage
+T_SAMPLE_POWER = 2.5
+T_SAMPLE_MIN = 0
+T_SAMPLE_MAX = 999
+T_TWO_STAGE_SWITCH = 15000
+
+INJECT_REG_WARMUP_END = 2000
+INJECT_REG_RAMP_END = 12000
+
+LR_CONSIST_WEIGHT_MAX = 0.5
+LR_CONSIST_WARMUP = 0
+LR_CONSIST_RAMP = 5000
 
 # ================= 3. Logic Functions =================
 def get_loss_weights(global_step):
@@ -182,8 +205,51 @@ def get_loss_weights(global_step):
     else:
         edge_progress = min(1.0, (global_step - EDGE_WARMUP_STEPS) / EDGE_RAMP_STEPS)
     weights['edge_grad'] = EDGE_GRAD_WEIGHT * edge_progress
-    weights['flat_hf'] = FLAT_HF_WEIGHT * edge_progress
+    weights['flat_hf'] = 0.0 if USE_LR_CONSISTENCY else (FLAT_HF_WEIGHT * edge_progress)
+
+    if not USE_LR_CONSISTENCY:
+        weights['lr_cons'] = 0.0
+    elif global_step < LR_CONSIST_WARMUP:
+        weights['lr_cons'] = 0.0
+    elif global_step < (LR_CONSIST_WARMUP + LR_CONSIST_RAMP):
+        p = (global_step - LR_CONSIST_WARMUP) / max(1, LR_CONSIST_RAMP)
+        weights['lr_cons'] = LR_CONSIST_WEIGHT_MAX * p
+    else:
+        weights['lr_cons'] = LR_CONSIST_WEIGHT_MAX
     return weights
+
+
+def inject_reg_lambda(step: int) -> float:
+    if step < INJECT_REG_WARMUP_END:
+        return INJECT_SCALE_REG_LAMBDA
+    if step < INJECT_REG_RAMP_END:
+        p = (step - INJECT_REG_WARMUP_END) / max(1, (INJECT_REG_RAMP_END - INJECT_REG_WARMUP_END))
+        return INJECT_SCALE_REG_LAMBDA * (1.0 - p)
+    return 0.0
+
+
+def sample_t(batch: int, device: str, step: int) -> torch.Tensor:
+    tmin = int(max(0, T_SAMPLE_MIN))
+    tmax = int(min(999, T_SAMPLE_MAX))
+    if tmax < tmin:
+        tmax = tmin
+
+    mode = T_SAMPLE_MODE.lower()
+    if mode == 'uniform':
+        return torch.randint(tmin, tmax + 1, (batch,), device=device).long()
+    if mode == 'power':
+        u = torch.rand((batch,), device=device)
+        span = float(max(1, tmax - tmin))
+        t = torch.floor((u ** float(T_SAMPLE_POWER)) * span + tmin)
+        return t.clamp(tmin, tmax).long()
+    if mode == 'two_stage':
+        if step < T_TWO_STAGE_SWITCH:
+            u = torch.rand((batch,), device=device)
+            span = float(max(1, tmax - tmin))
+            t = torch.floor((u ** float(T_SAMPLE_POWER)) * span + tmin)
+            return t.clamp(tmin, tmax).long()
+        return torch.randint(tmin, tmax + 1, (batch,), device=device).long()
+    raise ValueError(f"Unknown T_SAMPLE_MODE: {T_SAMPLE_MODE}")
 
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
@@ -340,6 +406,62 @@ def compute_injection_scale_reg(model: nn.Module, lambda_reg: float = 1e-4):
         u = float(lid) / float(depth)
         reg = reg + (u * u) * (F.softplus(p_scale) ** 2).mean()
     return reg * float(lambda_reg)
+
+class ParamEMA:
+    def __init__(self, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = {}
+
+    def register(self, named_params_iterable):
+        for name, p in named_params_iterable:
+            self.shadow[name] = p.detach().float().clone()
+
+    @torch.no_grad()
+    def update(self, named_params_iterable):
+        d = self.decay
+        one_minus_d = 1.0 - d
+        for name, p in named_params_iterable:
+            if name not in self.shadow:
+                self.shadow[name] = p.detach().float().clone()
+                continue
+            self.shadow[name].mul_(d).add_(p.detach().float(), alpha=one_minus_d)
+
+    @torch.no_grad()
+    def apply(self, named_params_iterable):
+        self.backup = {}
+        for name, p in named_params_iterable:
+            if name not in self.shadow:
+                continue
+            self.backup[name] = p.detach().clone()
+            p.data.copy_(self.shadow[name].to(device=p.device, dtype=p.dtype))
+
+    @torch.no_grad()
+    def restore(self, named_params_iterable):
+        for name, p in named_params_iterable:
+            if name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
+
+
+def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = "small"):
+    names = (
+        "adapter_alpha_mlp", "input_adaln", "input_res_proj", "style_fusion_mlp", "input_adapter_ln",
+        "aug_embedder", "injection_scales", "lora_A", "lora_B", "x_embedder"
+    )
+    out = []
+    for n, p in adapter.named_parameters():
+        if p.requires_grad:
+            out.append((f"adapter.{n}", p))
+    for n, p in pixart.named_parameters():
+        if not p.requires_grad:
+            continue
+        if mode == "all":
+            out.append((f"pixart.{n}", p))
+        elif any(k in n for k in names):
+            out.append((f"pixart.{n}", p))
+    return out
+
 
 def log_injection_scale_stats(model: nn.Module, prefix: str = "[InjectScale]"):
     if not hasattr(model, "injection_scales"):
@@ -826,7 +948,7 @@ def atomic_torch_save(state, path):
                 except Exception: pass
             return False, f"zip_error={e_zip}; legacy_error={e_old}"
 
-def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen):
+def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen, ema=None):
     global BASE_PIXART_SHA256
     psnr_v, ssim_v, lpips_v = metrics; priority, score = should_keep_ckpt(psnr_v, lpips_v)
     current_record = {"path": None, "epoch": epoch, "priority": priority, "score": score, "psnr": psnr_v, "lpips": lpips_v}
@@ -863,6 +985,7 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
         "optimizer": optimizer.state_dict(),
         "rng_state": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "numpy": np.random.get_state(), "python": random.getstate()},
         "dl_gen_state": dl_gen.get_state(), "pixart_trainable": pixart_sd, "best_records": next_best_records, "config_snapshot": get_config_snapshot(), "base_pixart_sha256": BASE_PIXART_SHA256, "env_info": {"torch": torch.__version__, "numpy": np.__version__},
+        "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
     }
     last_path = LAST_CKPT_PATH; ok_last, msg_last = atomic_torch_save(state, last_path)
     if ok_last: print(f"💾 Saved last checkpoint to {last_path} [{msg_last}]")
@@ -925,7 +1048,7 @@ def _strict_load_pixart_trainable_subset(pixart: nn.Module, saved_trainable: dic
         curr[k] = saved_trainable[k].to(dtype=curr[k].dtype)
     pixart.load_state_dict(curr, strict=False)
 
-def resume(pixart, adapter, optimizer, dl_gen):
+def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
@@ -954,6 +1077,21 @@ def resume(pixart, adapter, optimizer, dl_gen):
     if dl_state is not None:
         try: dl_gen.set_state(dl_state)
         except Exception as e: print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
+    if ema is not None:
+        ema_sd = ckpt.get("ema_state", None)
+        if isinstance(ema_sd, dict) and len(ema_sd) > 0:
+            dev_map = {}
+            if ema_named_params is not None:
+                dev_map = {name: p.device for name, p in ema_named_params}
+            restored = {}
+            for k, v in ema_sd.items():
+                if k not in dev_map:
+                    continue
+                restored[k] = v.float().to(device=dev_map[k])
+            ema.shadow = restored
+            print(f"✅ EMA restored: {len(ema.shadow)} tensors")
+        else:
+            print("ℹ️ EMA state not found in checkpoint; proceeding without EMA restore.")
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
 # ================= 9. Validation =================
@@ -1070,6 +1208,7 @@ def main():
         hard_injection_layers=HARD_INJECTION_LAYERS,
         transition_injection_layers=TRANSITION_INJECTION_LAYERS,
         detail_injection_layers=DETAIL_INJECTION_LAYERS,
+        injection_r_end=INJECT_R_END, injection_s_min=INJECT_S_MIN, injection_s_max=INJECT_S_MAX, injection_init_p=INJECT_INIT_P,
     ).to(DEVICE)
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
@@ -1137,13 +1276,13 @@ def main():
 
     # 3. Create Optimizer Groups
     optim_groups = [
-        {"params": adapter_params, "lr": 1e-4},
+        {"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01},
         {"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0},
-        {"params": lora_params, "lr": 1e-4},
-        {"params": other_pixart_params, "lr": 1e-5},
+        {"params": lora_params, "lr": 1e-4, "weight_decay": 0.0},
+        {"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01},
     ]
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-4})
+        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
     optimizer = torch.optim.AdamW(optim_groups)
 
     # 2. Clipper needs flat tensor list
@@ -1168,7 +1307,16 @@ def main():
     # We will manually calculate v_target and loss.
     # Note: IDDPM class is kept for schedule utils, but we bypass its loss function.
     diffusion = IDDPM(str(1000))
-    ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
+
+    ema = None
+    ema_named_params = []
+    if USE_EMA:
+        ema = ParamEMA(decay=EMA_DECAY)
+        ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
+        ema.register(ema_named_params)
+        print(f"✅ EMA enabled: decay={EMA_DECAY}, track_set={EMA_TRACK_SET}, tensors={len(ema_named_params)}")
+
+    ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
@@ -1189,7 +1337,7 @@ def main():
                 zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
             # [V8 Logic] V-Prediction Training
-            t = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
+            t = sample_t(zh.shape[0], DEVICE, step)
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
@@ -1223,19 +1371,14 @@ def main():
                 sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
                 target_v = alpha_t * noise - sigma_t * zh.float()
                 
-                # [V8 Logic] Min-SNR-Gamma Weighting
-                # SNR = alpha^2 / sigma^2
-                snr = (alpha_t**2) / (sigma_t**2)
-                # Min-SNR-Gamma (gamma=5 is standard for V-pred)
+                # [V8 Logic] Min-SNR-Gamma Weighting (per-sample, shape [B])
+                alpha_s = alpha_t[:, 0, 0, 0]
+                sigma_s = sigma_t[:, 0, 0, 0]
+                snr = (alpha_s ** 2) / (sigma_s ** 2)
                 gamma = 5.0
-                min_snr_gamma = torch.min(snr, torch.tensor(gamma, device=DEVICE))
-                
-                # Loss = MSE(pred_v, target_v) * Min-SNR / SNR (simplified weighting often just min(snr, gamma) / snr_something, but standard implementation is simpler:
-                # For v-prediction, standard MSE is weighted by SNR/(SNR+1) effectively.
-                # Here we use simplified MSE on V directly, which is robust.
-                # Optional: Add Min-SNR weighting:
+                min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
                 loss_weights = min_snr_gamma / snr
-                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.view(-1)).mean()
+                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3]) * loss_weights).mean()
 
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
@@ -1248,8 +1391,9 @@ def main():
                 loss_edge = torch.tensor(0.0, device=DEVICE)
                 loss_flat_hf = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                loss_lr_cons = torch.tensor(0.0, device=DEVICE)
 
-                need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0)
+                need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0) or (w.get('lr_cons', 0.0) > 0)
                 allow_by_t = int(t[0].item()) <= PIXEL_LOSS_T_MAX
                 allow_by_step = step >= PIXEL_LOSS_START_STEP
                 calc_pixel_loss = need_pixel_loss and allow_by_t and allow_by_step
@@ -1275,14 +1419,22 @@ def main():
                         loss_edge, loss_flat_hf, _ = edge_guided_losses(
                             img_p_valid, img_t_valid, q=EDGE_Q, pow_=EDGE_POW
                         )
-                    
 
-                inject_reg = compute_injection_scale_reg(pixart, INJECT_SCALE_REG_LAMBDA)
+                    if w.get('lr_cons', 0.0) > 0:
+                        lr_patch = lr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
+                        pred_ds = F.interpolate(img_p_valid, size=(64, 64), mode='bicubic', align_corners=False)
+                        lr_ds = F.interpolate(lr_patch, size=(64, 64), mode='bicubic', align_corners=False)
+                        py_ds = rgb01_to_y01((pred_ds + 1.0) * 0.5)
+                        ly_ds = rgb01_to_y01((lr_ds + 1.0) * 0.5)
+                        loss_lr_cons = F.l1_loss(py_ds, ly_ds)
+
+                inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
                 loss = (
                     loss_v 
                     + w['latent_l1']*loss_latent_l1
                     + w['lpips']*loss_lpips
                     + w['edge_grad'] * loss_edge + w['flat_hf'] * loss_flat_hf
+                    + w.get('lr_cons', 0.0) * loss_lr_cons
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -1294,6 +1446,8 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
+                if ema is not None:
+                    ema.update(ema_named_params)
                 accum_micro_steps = 0
 
             if i % 10 == 0:
@@ -1306,6 +1460,8 @@ def main():
                     'w_edge': f"{w['edge_grad']:.3f}",
                     'w_flat': f"{w['flat_hf']:.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
+                    'lr_cons': f"{loss_lr_cons.item():.3f}",
+                    'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                 })
 
         if accum_micro_steps > 0 and not reached_max_steps:
@@ -1313,13 +1469,31 @@ def main():
             optimizer.step()
             optimizer.zero_grad()
             step += 1
+            if ema is not None:
+                ema.update(ema_named_params)
             accum_micro_steps = 0
 
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
-        val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
-        if int(BEST_VAL_STEPS) in val_dict: metrics = val_dict[int(BEST_VAL_STEPS)]
-        else: metrics = next(iter(val_dict.values()))
-        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen)
+        print("🔎 [VAL] Raw weights")
+        val_raw = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
+        val_ema = None
+        if ema is not None:
+            print("🔎 [VAL] EMA weights")
+            ema.apply(ema_named_params)
+            val_ema = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
+            ema.restore(ema_named_params)
+
+        if val_ema is not None:
+            if int(BEST_VAL_STEPS) in val_raw and int(BEST_VAL_STEPS) in val_ema:
+                r = val_raw[int(BEST_VAL_STEPS)]
+                e = val_ema[int(BEST_VAL_STEPS)]
+                print(f"[VAL-CMP@{BEST_VAL_STEPS}] raw: PSNR={r[0]:.2f} SSIM={r[1]:.4f} LPIPS={r[2]:.4f} | "
+                      f"ema: PSNR={e[0]:.2f} SSIM={e[1]:.4f} LPIPS={e[2]:.4f}")
+            metrics = val_ema[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_ema else next(iter(val_ema.values()))
+        else:
+            metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
+
+        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen, ema=ema)
 
 if __name__ == "__main__":
     main()
