@@ -137,7 +137,9 @@ class MultiLevelAdapterV8(nn.Module):
                 self.layer_to_level[int(lid)] = src_level
 
             src_level = int(self.layer_to_level[int(lid)])
-            stride = 2 if src_level == 0 else 1
+            # Heads run after feature maps are aligned to a unified target_size in forward.
+            # Keep stride=1 for all layers to avoid accidental extra downsampling.
+            stride = 1
             head = nn.Sequential(
                 nn.Conv2d(base_channels, hidden_size, 3, stride=stride, padding=1),
                 nn.SiLU(),
