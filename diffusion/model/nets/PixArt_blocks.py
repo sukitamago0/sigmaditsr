@@ -96,7 +96,7 @@ class AttentionKVCompress(Attention_):
 
     def downsample_2d(self, tensor, H, W, scale_factor, sampling=None):
         if sampling is None or scale_factor == 1:
-            return tensor
+            return tensor, tensor.shape[1]
         B, N, C = tensor.shape
 
         if sampling == 'uniform_every':
