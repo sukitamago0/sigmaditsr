@@ -176,14 +176,14 @@ class MultiLevelAdapterV8(nn.Module):
         p3 = self.refine3(p3)
         return p0, p1, p2, p3
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_style: bool = True):
         rgb = x[:, :3]
         if self.in_channels >= 6:
             struct = x[:, 3:6]
         else:
             struct = x[:, 3:4].repeat(1, 3, 1, 1)
 
-        style_vec = self.style_extractor(x)
+        style_vec = self.style_extractor(x) if return_style else None
 
         r0 = self.rgb_stem(rgb)
         s0 = self.struct_stem(struct)

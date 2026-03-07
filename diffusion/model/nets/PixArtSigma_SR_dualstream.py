@@ -165,10 +165,13 @@ class PixArtSigmaSRDualStream(PixArtSigmaSR):
             "trans": float(F.softplus(self.alpha_trans).detach().cpu()),
             "detail": float(F.softplus(self.alpha_detail).detach().cpu()),
         }
+        active_injection_layers = getattr(self, "active_injection_layers", None)
+        active_injection_layers = set(active_injection_layers) if active_injection_layers is not None else None
         for i, block in enumerate(self.blocks):
             stage_name = self._resolve_stage(i)
             src_features = adapter_detail_features if stage_name == "detail" else adapter_structure_features
-            if i in src_features and i in self.injection_index_map and i < self.injection_cutoff_layer:
+            layer_enabled = (active_injection_layers is None) or (i in active_injection_layers)
+            if layer_enabled and i in src_features and i in self.injection_index_map and i < self.injection_cutoff_layer:
                 scale_idx = self.injection_index_map[i]
                 feat = src_features[i]
                 if feat.shape[-2:] != (self.h, self.w):

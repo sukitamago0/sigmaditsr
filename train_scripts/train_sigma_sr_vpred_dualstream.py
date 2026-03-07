@@ -129,8 +129,8 @@ DETAIL_INJECTION_LAYERS = list(range(20, 28))
 # [V8 Augmentation]
 COND_AUG_NOISE_RANGE = (0.0, 0.0) 
 
-WARMUP_STEPS = 4000         
-RAMP_UP_STEPS = 5000         
+WARMUP_STEPS = 2000
+RAMP_UP_STEPS = 3000
 TARGET_LPIPS_WEIGHT = 0.15
 LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 1.0
@@ -138,8 +138,8 @@ EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
 FLAT_HF_WEIGHT   = 0.05     # flat/defocus HF suppression (Laplacian)
 EDGE_Q           = 0.90     # GT edge quantile for normalization
 EDGE_POW         = 0.50     # mask sharpening ( <1 boosts weak edges )
-EDGE_WARMUP_STEPS = 3000
-EDGE_RAMP_STEPS = 4000
+EDGE_WARMUP_STEPS = 1000
+EDGE_RAMP_STEPS = 3000
 
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
@@ -205,7 +205,7 @@ INJECT_REG_RAMP_END = 12000
 
 LR_CONSIST_WEIGHT_MAX = 0.1
 LR_CONSIST_WARMUP = 0
-LR_CONSIST_RAMP = 12000
+LR_CONSIST_RAMP = 6000
 
 DUALSTREAM_ENABLED = True
 DUAL_CROSS_ATTN_START = 22
@@ -226,7 +226,7 @@ AUTO_STAGE_ENABLED = True
 ENABLE_SELECTIVE_TUNING = True
 TRAINABLE_BLOCKS_STAGE_A = list(range(4, 12))
 TRAINABLE_BLOCKS_STAGE_B = sorted(set(list(range(4, 18)) + list(range(20, 28))))
-TRAINABLE_BLOCKS_STAGE_C = sorted(set(list(range(4, 12)) + list(range(20, 28))))
+TRAINABLE_BLOCKS_STAGE_C = sorted(set(list(range(4, 18)) + list(range(20, 28))))
 STAGE_B_START_STEP = 2000
 STAGE_C_START_STEP = 5000
 
@@ -1122,6 +1122,12 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "injection_scales",
         "csft_dw",
         "csft_pw",
+        "lr_embedder",
+        "dual_norm",
+        "dual_q",
+        "dual_kv",
+        "dual_out",
+        "dual_gate",
     ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
@@ -1150,12 +1156,38 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             for _, p in pixart.blocks[i].named_parameters():
                 p.requires_grad_(True)
 
+    active_injection_layers = set(get_stage_injection_layers(train_stage))
+    if hasattr(pixart, "injection_index_map"):
+        for layer_id, scale_idx in pixart.injection_index_map.items():
+            is_active = int(layer_id) in active_injection_layers
+            for p in pixart.input_adaln[int(scale_idx)].parameters():
+                p.requires_grad_(is_active)
+            for p in pixart.input_res_proj[int(scale_idx)].parameters():
+                p.requires_grad_(is_active)
+            pixart.injection_scales[int(scale_idx)].requires_grad_(is_active)
+            for p in pixart.csft_dw[int(scale_idx)].parameters():
+                p.requires_grad_(is_active)
+            for p in pixart.csft_pw[int(scale_idx)].parameters():
+                p.requires_grad_(is_active)
+
+    if hasattr(pixart, "alpha_struct"):
+        pixart.alpha_struct.requires_grad_(True)
+    if hasattr(pixart, "alpha_trans"):
+        pixart.alpha_trans.requires_grad_(train_stage in ("B", "C"))
+    if hasattr(pixart, "alpha_detail"):
+        pixart.alpha_detail.requires_grad_(train_stage in ("B", "C"))
+
     x_embedder_frozen = 0
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
             if "x_embedder" in n and p.requires_grad:
                 p.requires_grad_(False)
                 x_embedder_frozen += 1
+
+    if ENABLE_LORA:
+        for n, p in pixart.named_parameters():
+            if ".base.weight" in n or ".base.bias" in n:
+                p.requires_grad_(False)
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
@@ -1177,6 +1209,18 @@ def stage_from_progress(global_step: int, default_stage: str = "A"):
     if global_step >= STAGE_B_START_STEP:
         return "B"
     return "A"
+
+
+def get_stage_injection_layers(stage: str):
+    stage = str(stage).upper()
+    hard = set(HARD_INJECTION_LAYERS)
+    trans = set(TRANSITION_INJECTION_LAYERS)
+    detail = set(DETAIL_INJECTION_LAYERS)
+    if stage == "A":
+        return sorted(hard)
+    if stage == "B":
+        return sorted(hard | trans | detail)
+    return sorted(hard | trans | detail)
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
@@ -1269,6 +1313,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
 def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_keys: set):
     stage = str(stage).upper()
+    pixart.active_injection_layers = get_stage_injection_layers(stage)
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, train_stage=stage)
     for p in adapter.parameters():
         p.requires_grad_(True)
@@ -1279,7 +1324,8 @@ def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_k
         "✅ Optim groups (pixart): "
         f"dual={group_counts['dual']}, inject={group_counts['inject']}, lora={group_counts['lora']}, "
         f"final_head={group_counts['final_head']}, other={group_counts['other']}, "
-        f"x_embedder={group_counts['x_embedder']}, adapter={group_counts['adapter']}"
+        f"x_embedder={group_counts['x_embedder']}, adapter={group_counts['adapter']}, "
+        f"active_inject_layers={pixart.active_injection_layers}"
     )
     return optimizer, params_to_clip
 
@@ -1648,7 +1694,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             
             adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in)
+                cond = adapter(adapter_in, return_style=USE_STYLE_FUSION)
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
@@ -1899,7 +1945,7 @@ def main():
 
             adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in) # Adapter sees image-domain structure guidance
+                cond = adapter(adapter_in, return_style=USE_STYLE_FUSION) # Adapter sees image-domain structure guidance
             cond_in = cond
             cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:

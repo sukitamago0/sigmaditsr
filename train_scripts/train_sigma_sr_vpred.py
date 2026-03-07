@@ -990,7 +990,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
             
-            cond = adapter(z_lr.float())
+            cond = adapter(z_lr.float(), return_style=False)
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
@@ -1201,7 +1201,7 @@ def main():
             # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = (aug_noise_level * 1000.0).float()
 
-            cond = adapter(zlr_aug.float()) # Adapter sees augmented LR
+            cond = adapter(zlr_aug.float(), return_style=False) # Adapter sees augmented LR
             cond_in = cond
             if USE_ADAPTER_CFDROPOUT and COND_DROP_PROB > 0:
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()

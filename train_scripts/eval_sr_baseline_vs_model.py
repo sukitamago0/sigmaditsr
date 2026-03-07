@@ -324,7 +324,7 @@ def evaluate(args):
             latents = randn_like_with_generator(z_hr, val_gen)
             run_timesteps = scheduler.timesteps
 
-        cond = adapter(z_lr.float())
+        cond = adapter(z_lr.float(), return_style=False)
         aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
         for t in run_timesteps:
