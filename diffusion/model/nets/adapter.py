@@ -209,6 +209,15 @@ class MultiLevelAdapterV8(nn.Module):
         edge_prior = edge_prior / (edge_prior.amax(dim=(-2, -1), keepdim=True) + 1e-6)
         edge_prior_logits = (edge_prior - 0.5) * 4.0
 
+        # Texture prior for detail-stage gating (avoid over-biasing detail gates to hard edges only).
+        rgb_luma = 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+        rgb_luma = F.interpolate(rgb_luma, size=target_size, mode="bilinear", align_corners=False)
+        local_mean = F.avg_pool2d(rgb_luma, kernel_size=3, stride=1, padding=1)
+        local_var = F.avg_pool2d((rgb_luma - local_mean) ** 2, kernel_size=3, stride=1, padding=1)
+        texture_prior = torch.sqrt(local_var + 1e-6)
+        texture_prior = texture_prior / (texture_prior.amax(dim=(-2, -1), keepdim=True) + 1e-6)
+        texture_prior_logits = (texture_prior - 0.5) * 3.0
+
         structure_outputs = {}
         detail_outputs = {}
         gates = {}
@@ -220,9 +229,11 @@ class MultiLevelAdapterV8(nn.Module):
                 feat = F.interpolate(feat, size=target_size, mode="bilinear", align_corners=False)
             if layer_id <= 17:
                 structure_outputs[layer_id] = head(feat)
+                prior_logits = edge_prior_logits
             else:
                 detail_outputs[layer_id] = self.detail_heads[layer_str](feat)
-            gates[layer_id] = torch.sigmoid(edge_prior_logits + self.gate_heads[layer_str](feat))
+                prior_logits = 0.35 * edge_prior_logits + 0.65 * texture_prior_logits
+            gates[layer_id] = torch.sigmoid(prior_logits + self.gate_heads[layer_str](feat))
 
         outputs = {
             "structure": structure_outputs,

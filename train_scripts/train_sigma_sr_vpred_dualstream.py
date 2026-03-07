@@ -171,7 +171,7 @@ CONCAT_LR_DROP_SCHEDULE = [
 CONCAT_LR_DROP_NO_RESCALE = True
 INJECT_SCALE_REG_LAMBDA = 1e-4
 PIXEL_LOSS_T_MAX = 250
-PIXEL_LOSS_START_STEP = WARMUP_STEPS
+PIXEL_LOSS_START_STEP = 1000
 LATENT_L1_T_MAX = 400  # apply latent L1 only at lower-noise timesteps
 
 USE_LR_CONSISTENCY = True 
@@ -205,7 +205,7 @@ INJECT_REG_RAMP_END = 12000
 
 LR_CONSIST_WEIGHT_MAX = 0.1
 LR_CONSIST_WARMUP = 0
-LR_CONSIST_RAMP = 6000
+LR_CONSIST_RAMP = 4000
 
 DUALSTREAM_ENABLED = True
 DUAL_CROSS_ATTN_START = 22
@@ -1113,6 +1113,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
 
     always_train_keywords = [
         "x_embedder",
+        "aug_embedder",
         "final_layer",
         "input_adaln",
         "input_res_proj",
