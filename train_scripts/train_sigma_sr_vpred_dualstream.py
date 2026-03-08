@@ -83,6 +83,10 @@ VAL_LR_DIR_CANDIDATES = [
     "/data/DF2K/DF2K_valid_LR_bicubic/X4",
 ]
 VAL_LR_DIR = next((p for p in VAL_LR_DIR_CANDIDATES if os.path.exists(p)), None)
+REALSR_VAL_ROOTS = [
+    "/data/RealSR/Nikon/Test/4",
+    "/data/RealSR/Canon/Test/4",
+]
 
 PRETRAINED_ROOT = os.getenv("DTSR_PRETRAINED_ROOT", "/home/hello/HJT/PixArt-sigma/output/pretrained_models")
 PIXART_PATH = os.path.join(PRETRAINED_ROOT, "PixArt-Sigma-XL-2-512-MS.pth")
@@ -143,7 +147,7 @@ EDGE_RAMP_STEPS = 1200
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
 KEEP_TOPK = 1
-VAL_MODE = "lr_dir"
+VAL_MODE = "realsr"
 VAL_PACK_DIR = os.path.join(PROJECT_ROOT, "valpacks", "df2k_train_like_50_seed3407")
 VAL_PACK_LR_DIR_NAME = "lq512"
 TRAIN_DEG_MODE = "highorder"
@@ -1114,6 +1118,50 @@ class ValPackDataset(Dataset):
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
         return {"hr": hr_tensor, "lr": lr_tensor, "path": str(hr_path)}
 
+class RealSR_Val_Paired_Dataset(Dataset):
+    def __init__(self, roots, crop_size=512):
+        self.crop_size = int(crop_size)
+        self.norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
+        self.to_tensor = transforms.ToTensor()
+        self.pairs = []
+
+        for root in roots:
+            root = str(root)
+            if not os.path.isdir(root):
+                continue
+            for hr_path in sorted(glob.glob(os.path.join(root, "*_HR.png"))):
+                lr_path = hr_path.replace("_HR.png", "_LR4.png")
+                if os.path.exists(lr_path):
+                    self.pairs.append((hr_path, lr_path))
+
+        if len(self.pairs) == 0:
+            raise FileNotFoundError(
+                f"No RealSR validation pairs found under roots={roots}. Expected '*_HR.png' and '*_LR4.png'."
+            )
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        hr_path, lr_path = self.pairs[idx]
+        hr_pil = Image.open(hr_path).convert("RGB")
+        lr_pil = Image.open(lr_path).convert("RGB")
+
+        lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=4)
+        lr_crop = TF.center_crop(lr_aligned, (self.crop_size // 4, self.crop_size // 4))
+        hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
+        lr_up = TF.resize(
+            lr_crop,
+            (self.crop_size, self.crop_size),
+            interpolation=transforms.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+
+        hr_tensor = self.norm(self.to_tensor(hr_crop))
+        lr_tensor = self.norm(self.to_tensor(lr_up))
+        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+
+
 # ================= 7. LoRA =================
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r: int, alpha: float):
@@ -1898,7 +1946,10 @@ def main():
             raise FileNotFoundError(f"Required pretrained path missing: {pth}")
 
     train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
-    if VAL_MODE == "valpack":
+    if VAL_MODE == "realsr":
+        val_ds = RealSR_Val_Paired_Dataset(REALSR_VAL_ROOTS, crop_size=512)
+        print(f"[VAL] mode=realsr roots={REALSR_VAL_ROOTS} pairs={len(val_ds)}")
+    elif VAL_MODE == "valpack":
         val_ds = ValPackDataset(VAL_PACK_DIR, lr_dir_name=VAL_PACK_LR_DIR_NAME, crop_size=512)
         print(f"[VAL] mode=valpack path={VAL_PACK_DIR}/{VAL_PACK_LR_DIR_NAME}")
     elif VAL_MODE == "train_like":
