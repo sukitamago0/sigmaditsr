@@ -1988,7 +1988,15 @@ def main():
     if not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
         init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
 
-    ep_start, step, best, stage_controller_state = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
+    # Build controller first. If resuming, pre-read controller stage from checkpoint
+    # so optimizer param-groups are initialized with matching stage before resume().
+    resume_stage_controller_state = None
+    if os.path.exists(LAST_CKPT_PATH):
+        try:
+            _resume_ckpt_meta = torch.load(LAST_CKPT_PATH, map_location="cpu")
+            resume_stage_controller_state = _resume_ckpt_meta.get("stage_controller", None)
+        except Exception as e:
+            print(f"⚠️ Failed to pre-read stage controller from resume checkpoint: {e}")
 
     controller = StageController(
         k=STAGE_CONTROLLER_K,
@@ -1997,12 +2005,19 @@ def main():
         th_b2c=STAGE_THRESH_B2C,
         initial_stage=str(TRAIN_STAGE).upper(),
     )
-    if stage_controller_state is not None:
-        controller.load_state_dict(stage_controller_state)
+    if resume_stage_controller_state is not None:
+        controller.load_state_dict(resume_stage_controller_state)
+
     current_stage = controller.current_stage
     validation_count = 0
     optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
     _maybe_empty_cuda_cache()
+
+    ep_start, step, best, stage_controller_state = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
+    if stage_controller_state is not None:
+        controller.load_state_dict(stage_controller_state)
+    current_stage = controller.current_stage
+
     if ema is not None:
         ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
         ema.register(ema_named_params)
