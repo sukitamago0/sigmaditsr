@@ -142,7 +142,6 @@ EDGE_RAMP_STEPS = 1200
 
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
-PSNR_SWITCH = 24.0
 KEEP_TOPK = 1
 VAL_MODE = "lr_dir"
 VAL_PACK_DIR = os.path.join(PROJECT_ROOT, "valpacks", "df2k_train_like_50_seed3407")
@@ -226,8 +225,6 @@ ENABLE_SELECTIVE_TUNING = True
 TRAINABLE_BLOCKS_STAGE_A = list(range(4, 18))
 TRAINABLE_BLOCKS_STAGE_B = sorted(set(list(range(4, 18)) + list(range(20, 28))))
 TRAINABLE_BLOCKS_STAGE_C = sorted(set(list(range(4, 18)) + list(range(20, 28))))
-STAGE_B_START_STEP = 1200
-STAGE_C_START_STEP = 3600
 STAGE_CONTROLLER_K = 3
 STAGE_CONTROLLER_PATIENCE = 2
 # Stage thresholds are explicit experiment knobs.
@@ -694,11 +691,11 @@ def get_config_snapshot():
 
 
 def validate_schedule_alignment():
-    # Legacy fixed-step stage schedule has been retired in favor of StageController.
-    if STAGE_B_START_STEP >= STAGE_C_START_STEP:
+    # Stage progression is controlled by StageController (PSNR-driven).
+    if not (STAGE_THRESH_A2B < STAGE_THRESH_B2C):
         raise ValueError(
-            f"Stage schedule constants must satisfy STAGE_B_START_STEP < STAGE_C_START_STEP, got "
-            f"{STAGE_B_START_STEP} >= {STAGE_C_START_STEP}."
+            f"Stage thresholds must satisfy STAGE_THRESH_A2B < STAGE_THRESH_B2C, got "
+            f"{STAGE_THRESH_A2B} >= {STAGE_THRESH_B2C}."
         )
 
 
@@ -707,6 +704,25 @@ def validate_s2d_decoupling():
         raise ValueError("S2D requires DUALSTREAM_ENABLED=False (no LR direct late-stream injection).")
     if ENABLE_LORA:
         raise ValueError("S2D refactor freezes backbone; set ENABLE_LORA=False.")
+
+def load_resume_injection_config(default_cfg: dict):
+    cfg = dict(default_cfg)
+    if not os.path.exists(LAST_CKPT_PATH):
+        return cfg
+    try:
+        ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
+        inj = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
+        if not isinstance(inj, dict) or len(inj) == 0:
+            return cfg
+        cfg["injection_strategy"] = str(inj.get("injection_strategy", cfg["injection_strategy"]))
+        cfg["injection_cutoff_layer"] = int(inj.get("injection_cutoff_layer", cfg["injection_cutoff_layer"]))
+        cfg["hard_layers"] = list(inj.get("hard_layers", cfg["hard_layers"]))
+        cfg["transition_layers"] = list(inj.get("transition_layers", cfg["transition_layers"]))
+        cfg["detail_layers"] = list(inj.get("detail_layers", cfg["detail_layers"]))
+        print("[ResumeConfig] injection_config loaded from LAST_CKPT_PATH")
+    except Exception as e:
+        print(f"⚠️ Failed to load injection_config from LAST_CKPT_PATH: {e}")
+    return cfg
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -1453,9 +1469,11 @@ def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_k
 
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
-    if not math.isfinite(psnr_v): return (999, float("inf"))
-    if psnr_v >= PSNR_SWITCH and math.isfinite(lpips_v): return (0, lpips_v)
-    return (1, -psnr_v)
+    # Main SR experiment: select best checkpoints by PSNR first, LPIPS as tie-breaker only.
+    if not math.isfinite(psnr_v):
+        return (999, float("inf"), float("inf"))
+    lp = float(lpips_v) if math.isfinite(lpips_v) else float("inf")
+    return (0, -float(psnr_v), lp)
 
 def atomic_torch_save(state, path):
     tmp = path + ".tmp"
@@ -1509,9 +1527,7 @@ def save_smart(
         "eval_steps": int(eval_steps),
     }
 
-    # keep a single global best by should_keep_ckpt rule:
-    # - psnr < PSNR_SWITCH: maximize PSNR
-    # - psnr >= PSNR_SWITCH: minimize LPIPS
+    # keep a single global best by should_keep_ckpt rule (PSNR-first).
     prev_best = best_records[0] if len(best_records) > 0 else None
     save_as_best = (
         prev_best is None
@@ -1903,12 +1919,20 @@ def main():
         "kv_compress_layer": list(KV_COMPRESS_LAYERS),
     } if KV_COMPRESS_ENABLE else None
 
+    inj_cfg = load_resume_injection_config({
+        "injection_strategy": INJECTION_STRATEGY,
+        "injection_cutoff_layer": INJECTION_CUTOFF_LAYER,
+        "hard_layers": list(HARD_INJECTION_LAYERS),
+        "transition_layers": list(TRANSITION_INJECTION_LAYERS),
+        "detail_layers": list(DETAIL_INJECTION_LAYERS),
+    })
+
     pixart = PixArtSigmaSRDualStream_XL_2(
         input_size=64, in_channels=4, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
-        injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
-        hard_injection_layers=HARD_INJECTION_LAYERS,
-        transition_injection_layers=TRANSITION_INJECTION_LAYERS,
-        detail_injection_layers=DETAIL_INJECTION_LAYERS,
+        injection_cutoff_layer=int(inj_cfg["injection_cutoff_layer"]), injection_strategy=str(inj_cfg["injection_strategy"]),
+        hard_injection_layers=list(inj_cfg["hard_layers"]),
+        transition_injection_layers=list(inj_cfg["transition_layers"]),
+        detail_injection_layers=list(inj_cfg["detail_layers"]),
         dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
         use_style_fusion=USE_STYLE_FUSION,
         kv_compress_config=kv_cfg,
@@ -1919,11 +1943,11 @@ def main():
     else:
         print("[KV-Compress] disabled")
     overlap_start = int(max(0, DUAL_CROSS_ATTN_START))
-    overlap_end = int(min(INJECTION_CUTOFF_LAYER - 1, pixart.depth - 1))
+    overlap_end = int(min(int(inj_cfg["injection_cutoff_layer"]) - 1, pixart.depth - 1))
     if overlap_end >= overlap_start:
         print(f"[Inject×Dual overlap] layers {overlap_start}..{overlap_end}")
     else:
-        print(f"[Inject×Dual overlap] none (inject< {INJECTION_CUTOFF_LAYER}, dual>= {DUAL_CROSS_ATTN_START})")
+        print(f"[Inject×Dual overlap] none (inject< {int(inj_cfg['injection_cutoff_layer'])}, dual>= {DUAL_CROSS_ATTN_START})")
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
