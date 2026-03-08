@@ -1348,7 +1348,9 @@ def get_stage_injection_layers(stage: str):
     if stage == "A":
         return sorted(hard | trans)
     if stage == "B":
-        return sorted(hard | trans | detail)
+        # Stage B keeps structure-only injection set; only loss policy changes.
+        return sorted(hard | trans)
+    # Stage C unlocks detail layers together with semantic detail path.
     return sorted(hard | trans | detail)
 
 
@@ -1950,7 +1952,6 @@ def main():
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
-    current_stage = stage_from_progress(0, default_stage=TRAIN_STAGE)
     optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
     _maybe_empty_cuda_cache()
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
@@ -2108,9 +2109,9 @@ def main():
 
                 need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0) or (w.get('lr_cons', 0.0) > 0)
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
-                allow_by_step = step >= PIXEL_LOSS_START_STEP
-                pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_step else 0
-                calc_pixel_loss = need_pixel_loss and allow_by_step and (pixel_loss_num_samples > 0)
+                allow_by_stage = (current_stage in ("B", "C"))
+                pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
+                calc_pixel_loss = need_pixel_loss and allow_by_stage and (pixel_loss_num_samples > 0)
 
                 if calc_pixel_loss:
                     active_idx = torch.nonzero(pixel_t_mask, as_tuple=False).squeeze(1)
