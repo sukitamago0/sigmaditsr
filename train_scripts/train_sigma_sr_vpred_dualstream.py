@@ -132,10 +132,6 @@ DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
 # [V8 Augmentation]
 COND_AUG_NOISE_RANGE = (0.0, 0.0) 
 
-WARMUP_STEPS = 2400
-RAMP_UP_STEPS = 2400
-TARGET_LPIPS_WEIGHT = 0.12
-LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 0.25
 EDGE_GRAD_WEIGHT = 0.02     # edge-region gradient matching
 FLAT_HF_WEIGHT   = 0.00     # flat/defocus HF suppression (Laplacian)
@@ -175,7 +171,6 @@ CONCAT_LR_DROP_NO_RESCALE = True
 INJECT_SCALE_REG_LAMBDA = 1e-4
 PIXEL_LOSS_T_MAX = 250
 # Structure-first schedule: start pixel-space supervision at Stage B boundary.
-PIXEL_LOSS_START_STEP = 1200
 LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 
 USE_LR_CONSISTENCY = True 
@@ -235,10 +230,10 @@ STAGE_B_START_STEP = 1200
 STAGE_C_START_STEP = 3600
 STAGE_CONTROLLER_K = 3
 STAGE_CONTROLLER_PATIENCE = 2
-STAGE_PSNR_REF = 21.0
-STAGE_PSNR_CEILING = 26.0
-STAGE_TH_A2B = STAGE_PSNR_REF + 0.55 * (STAGE_PSNR_CEILING - STAGE_PSNR_REF)
-STAGE_TH_B2C = STAGE_PSNR_REF + 0.75 * (STAGE_PSNR_CEILING - STAGE_PSNR_REF)
+# Stage thresholds are explicit experiment knobs.
+# Prefer setting these from your current val-pack reference/ceiling stats.
+STAGE_THRESH_A2B = 23.75
+STAGE_THRESH_B2C = 24.75
 
 # Prior-preserving selective adaptation: LoRA windows/ranks by stage block groups.
 ENABLE_LORA = False
@@ -699,14 +694,10 @@ def get_config_snapshot():
 
 
 def validate_schedule_alignment():
-    if PIXEL_LOSS_START_STEP < STAGE_B_START_STEP:
-        raise ValueError(
-            f"PIXEL_LOSS_START_STEP ({PIXEL_LOSS_START_STEP}) must be >= STAGE_B_START_STEP ({STAGE_B_START_STEP}) "
-            "to keep structure-first scheduling."
-        )
+    # Legacy fixed-step stage schedule has been retired in favor of StageController.
     if STAGE_B_START_STEP >= STAGE_C_START_STEP:
         raise ValueError(
-            f"Stage schedule must satisfy STAGE_B_START_STEP < STAGE_C_START_STEP, got "
+            f"Stage schedule constants must satisfy STAGE_B_START_STEP < STAGE_C_START_STEP, got "
             f"{STAGE_B_START_STEP} >= {STAGE_C_START_STEP}."
         )
 
@@ -1952,8 +1943,6 @@ def main():
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
-    optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
-    _maybe_empty_cuda_cache()
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
     vae.enable_slicing()
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
@@ -2004,8 +1993,8 @@ def main():
     controller = StageController(
         k=STAGE_CONTROLLER_K,
         patience=STAGE_CONTROLLER_PATIENCE,
-        th_a2b=STAGE_TH_A2B,
-        th_b2c=STAGE_TH_B2C,
+        th_a2b=STAGE_THRESH_A2B,
+        th_b2c=STAGE_THRESH_B2C,
         initial_stage=str(TRAIN_STAGE).upper(),
     )
     if stage_controller_state is not None:
