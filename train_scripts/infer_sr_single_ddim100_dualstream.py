@@ -10,6 +10,7 @@ if PROJECT_ROOT not in sys.path:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
 from diffusers import AutoencoderKL, DDIMScheduler
@@ -36,6 +37,22 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
         latents = z_lr + noise
     return latents.to(dtype=dtype), timesteps[start_index:]
 
+
+
+
+def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
+    # 4ch structural-only input: [GaussianLowpass(gray), gray, SobelMag, |Laplacian|]
+    img01 = (lr_m11.float() + 1.0) * 0.5
+    gray = 0.299 * img01[:, 0:1] + 0.587 * img01[:, 1:2] + 0.114 * img01[:, 2:3]
+    sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], device=gray.device, dtype=gray.dtype)
+    sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], device=gray.device, dtype=gray.dtype)
+    lap = torch.tensor([[[[0, 1, 0], [1, -4, 1], [0, 1, 0]]]], device=gray.device, dtype=gray.dtype)
+    gx = F.conv2d(gray, sobel_x, padding=1)
+    gy = F.conv2d(gray, sobel_y, padding=1)
+    sobel_mag = torch.sqrt(gx * gx + gy * gy + 1e-6)
+    lap_abs = F.conv2d(gray, lap, padding=1).abs()
+    lowpass = F.avg_pool2d(gray, kernel_size=7, stride=1, padding=3)
+    return torch.cat([lowpass, gray, sobel_mag, lap_abs], dim=1).clamp(0.0, 1.0)
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None:
@@ -146,7 +163,7 @@ def run(args):
 
     pixart = PixArtSigmaSRDualStream_XL_2(
         input_size=64,
-        in_channels=8,
+        in_channels=4,
         out_channels=4,
         sparse_inject_ratio=1.0,
         injection_cutoff_layer=14,
@@ -155,7 +172,7 @@ def run(args):
         injection_s_min=0.1,
         injection_s_max=1.0,
         injection_init_p=2.0,
-        dualstream_enabled=True,
+        dualstream_enabled=False,
         cross_attn_start_layer=16,
         dual_num_heads=16,
     ).to(device)
@@ -165,13 +182,6 @@ def run(args):
         base = base["state_dict"]
     if "pos_embed" in base:
         del base["pos_embed"]
-    if "x_embedder.proj.weight" in base and base["x_embedder.proj.weight"].shape[1] == 4:
-        w4 = base["x_embedder.proj.weight"]
-        w8 = torch.zeros((w4.shape[0], 8, w4.shape[2], w4.shape[3]), dtype=w4.dtype)
-        w8[:, :4] = w4
-        w8[:, 4:] = w4 * 0.5
-        base["x_embedder.proj.weight"] = w8
-
     if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
         pixart.load_pretrained_weights_with_zero_init(base)
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
@@ -237,7 +247,8 @@ def run(args):
         latents = randn_like_with_generator(z_lr.to(compute_dtype), gen)
         run_timesteps = scheduler.timesteps
 
-    cond = adapter(z_lr.float(), return_style=False)
+    adapter_in = build_adapter_struct_input(lr).to(dtype=torch.float32)
+    cond = adapter(adapter_in, sem_image=lr, return_style=False)
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
     for t in run_timesteps:
@@ -245,7 +256,7 @@ def run(args):
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
             drop_uncond = torch.ones(latents.shape[0], device=device)
             drop_cond = torch.ones(latents.shape[0], device=device)
-            model_in = torch.cat([latents.to(compute_dtype), z_lr.to(compute_dtype)], dim=1)
+            model_in = latents.to(compute_dtype)
             if args.cfg_scale == 1.0:
                 out = pixart(
                     x=model_in,

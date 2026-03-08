@@ -117,7 +117,7 @@ NUM_WORKERS = 8
 LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
-TRAIN_PIXART_X_EMBEDDER = True  # enable concat LR latent path learning in x_embedder
+TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
 INJECTION_STRATEGY = "three_stage_sr"
@@ -125,9 +125,9 @@ INJECT_R_END = 0.1
 INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
-HARD_INJECTION_LAYERS = list(range(4, 12))
-TRANSITION_INJECTION_LAYERS = list(range(12, 18))
-DETAIL_INJECTION_LAYERS = list(range(20, 28))
+HARD_INJECTION_LAYERS = [2, 4, 6, 8, 10, 12]
+TRANSITION_INJECTION_LAYERS = []
+DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
 
 # [V8 Augmentation]
 COND_AUG_NOISE_RANGE = (0.0, 0.0) 
@@ -1195,7 +1195,6 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         p.requires_grad_(False)
 
     always_train_keywords = [
-        "x_embedder",
         "aug_embedder",
         "final_layer",
         "input_adaln",
@@ -1206,7 +1205,14 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "injection_scales",
         "csft_dw",
         "csft_pw",
+        "sem_norm",
+        "sem_q",
+        "sem_kv",
+        "sem_out",
+        "sem_gate",
     ]
+    if train_x_embedder:
+        always_train_keywords.append("x_embedder")
     if DUALSTREAM_ENABLED:
         always_train_keywords.extend(["lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate"])
     if ENABLE_LORA:
@@ -1989,8 +1995,7 @@ def main():
             # 1. Sample noise level for LR
             aug_low, aug_high = runtime_cfg["cond_aug_noise_range"]
             aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (aug_high - aug_low) + aug_low
-            # 2. Add noise to LR
-            zlr_aug = zl.float() + torch.randn_like(zl) * aug_noise_level[:, None, None, None]
+            # 2. (S2D) keep LR as structural image conditioning; only pass aug level embedding.
             # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = (aug_noise_level * 1000.0).float()
 

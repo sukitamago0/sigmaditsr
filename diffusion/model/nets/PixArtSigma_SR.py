@@ -25,9 +25,9 @@ class PixArtSigmaSR(PixArtMS):
         injection_init_p: float = 2.0,
         use_csft: bool = True,
         use_style_fusion: bool = False,
-        hard_injection_layers=tuple(range(4, 12)),
-        transition_injection_layers=tuple(range(12, 18)),
-        detail_injection_layers=tuple(range(20, 28)),
+        hard_injection_layers=(2, 4, 6, 8, 10, 12),
+        transition_injection_layers=tuple(),
+        detail_injection_layers=(14, 16, 18, 20, 22, 24),
         **kwargs,
     ):
         # Root-cause alignment for Sigma->SR adaptation:
