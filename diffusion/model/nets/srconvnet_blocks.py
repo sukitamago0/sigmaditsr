@@ -35,11 +35,14 @@ class FourierUnit(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.size()
-        ffted = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
+        in_dtype = x.dtype
+        x32 = x.float()
+        ffted = torch.fft.rfft2(x32, dim=(-2, -1), norm="ortho")
         ffted = torch.cat([ffted.real, ffted.imag], dim=1)
         ffted = self.act(self.conv_layer(ffted))
         real2, imag2 = torch.chunk(ffted, 2, dim=1)
-        return torch.fft.irfft2(torch.complex(real2, imag2), s=(h, w), dim=(-2, -1), norm="ortho")
+        out32 = torch.fft.irfft2(torch.complex(real2.float(), imag2.float()), s=(h, w), dim=(-2, -1), norm="ortho")
+        return out32.to(dtype=in_dtype)
 
 
 class FConvMod(nn.Module):
