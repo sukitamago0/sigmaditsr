@@ -220,9 +220,9 @@ KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
 # Staged unfreeze for resume from old checkpoint
-TRAIN_STAGE = "A"  # vnext-like unfreeze policy ignores staged gating
+TRAIN_STAGE = "C"  # single-stage training
 STAGE_C_LATE_BLOCK_FRAC = 1.0
-AUTO_STAGE_ENABLED = True
+AUTO_STAGE_ENABLED = False
 
 # Selective tuning (structure-prioritized) for 24GB stability and cleaner attribution.
 ENABLE_SELECTIVE_TUNING = True
@@ -296,9 +296,7 @@ PHASE0_NUM_SAMPLES = 4
 
 
 def get_phase_runtime_cfg(stage: str):
-    stage = str(stage).upper()
-    if stage in PHASE_RUNTIME_CFG:
-        return PHASE_RUNTIME_CFG[stage]
+    del stage
     return PHASE_RUNTIME_CFG["C"]
 
 def get_loss_weights(global_step, stage: str):
@@ -425,8 +423,10 @@ def edge_guided_losses(pred_m11: torch.Tensor, gt_m11: torch.Tensor, q: float = 
 
 @torch.cuda.amp.autocast(enabled=False)
 def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
-    # New adapter input is lr_small in RGB pixel space.
+    # Adapter input is lr_small in RGB pixel space; if already small, keep as-is.
     h, w = lr_m11.shape[-2:]
+    if max(h, w) <= 160:
+        return lr_m11.float().clamp(-1.0, 1.0)
     return F.interpolate(lr_m11.float(), size=(h // 4, w // 4), mode='bicubic', align_corners=False, antialias=True).clamp(-1.0, 1.0)
 
 
@@ -1046,7 +1046,7 @@ class DF2K_Online_Dataset(Dataset):
         lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": build_adapter_struct_input(lr_tensor), "path": hr_path}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
     def __init__(self, hr_root, lr_root=None, crop_size=512):
@@ -1071,7 +1071,7 @@ class DF2K_Val_Fixed_Dataset(Dataset):
             w, h = hr_crop.size; lr_small = hr_crop.resize((w//4, h//4), Image.BICUBIC)
             lr_crop = lr_small.resize((w, h), Image.BICUBIC)
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": build_adapter_struct_input(lr_tensor), "path": hr_path}
 
 class DF2K_Val_Degraded_Dataset(Dataset):
     def __init__(self, hr_root, crop_size=512, seed=3407, deg_mode="highorder"):
@@ -1092,7 +1092,7 @@ class DF2K_Val_Degraded_Dataset(Dataset):
             gen = torch.Generator(); gen.manual_seed(self.seed + idx)
             # Ensure only 2 values unpacked
             lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen) # Ignore meta here
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": build_adapter_struct_input(lr_tensor), "path": hr_path}
 
 class ValPackDataset(Dataset):
     def __init__(self, pack_dir: str, lr_dir_name: str = "lq512", crop_size: int = 512):
@@ -1110,7 +1110,7 @@ class ValPackDataset(Dataset):
         if lr_crop.size != (self.crop_size, self.crop_size):
             lr_crop = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": str(hr_path)}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": build_adapter_struct_input(lr_tensor), "path": str(hr_path)}
 
 class RealSR_Val_Paired_Dataset(Dataset):
     def __init__(self, roots, crop_size=512):
@@ -1153,7 +1153,7 @@ class RealSR_Val_Paired_Dataset(Dataset):
 
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": build_adapter_struct_input(lr_tensor), "path": hr_path}
 
 
 # ================= 7. LoRA =================
@@ -1875,13 +1875,18 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
             
-            adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
-            with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, t_embed=None)
+            lr_small = batch.get("lr_small", None)
+            if lr_small is None:
+                lr_small = build_adapter_struct_input(lr)
+            lr_small = lr_small.to(DEVICE, dtype=COMPUTE_DTYPE)
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
                 t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
+                with torch.no_grad():
+                    t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
+                with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+                    cond = adapter(lr_small, t_embed=t_embed)
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     if FORCE_DROP_TEXT: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.ones(latents.shape[0], device=DEVICE)
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
@@ -2133,7 +2138,7 @@ def main():
                 reached_max_steps = True
                 break
 
-            hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE)
+            hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE); lr_small_b = batch.get('lr_small', None)
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
                 zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
@@ -2153,9 +2158,15 @@ def main():
             # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = (aug_noise_level * 1000.0).float()
 
-            adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
+            if lr_small_b is None:
+                adapter_in = build_adapter_struct_input(lr)
+            else:
+                adapter_in = lr_small_b.to(DEVICE)
+            adapter_in = adapter_in.to(dtype=COMPUTE_DTYPE)
+            with torch.no_grad():
+                t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, t_embed=None) # Adapter sees image-domain structure guidance
+                cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
             cond_in = cond
             cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:

@@ -42,6 +42,8 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 
 def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
     h, w = lr_m11.shape[-2:]
+    if max(h, w) <= 160:
+        return lr_m11.float().clamp(-1.0, 1.0)
     return F.interpolate(lr_m11.float(), size=(h // 4, w // 4), mode='bicubic', align_corners=False, antialias=True).clamp(-1.0, 1.0)
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
@@ -199,8 +201,10 @@ def run(args):
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
 
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
+    ckpt_lora_rank = int(ckpt.get("lora_rank", args.lora_rank))
+    ckpt_lora_alpha = int(ckpt.get("lora_alpha", ckpt_lora_rank))
     if has_lora:
-        apply_lora(pixart, rank=args.lora_rank, alpha=args.lora_alpha)
+        apply_lora(pixart, rank=ckpt_lora_rank, alpha=ckpt_lora_alpha)
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
@@ -247,12 +251,13 @@ def run(args):
         latents = randn_like_with_generator(z_lr.to(compute_dtype), gen)
         run_timesteps = scheduler.timesteps
 
-    adapter_in = build_adapter_struct_input(lr).to(dtype=torch.float32)
-    cond = adapter(adapter_in, t_embed=None)
+    adapter_in = build_adapter_struct_input(lr).to(device=device, dtype=torch.float32)
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
+        t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
+        cond = adapter(adapter_in, t_embed=t_embed.float())
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
             drop_uncond = torch.ones(latents.shape[0], device=device)
             drop_cond = torch.ones(latents.shape[0], device=device)
@@ -322,8 +327,8 @@ def parse_args():
     parser.set_defaults(use_lq_init=True)
     parser.add_argument("--lq-init-strength", type=float, default=0.3)
     parser.add_argument("--cfg-scale", type=float, default=1.0)
-    parser.add_argument("--lora-rank", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-rank", type=int, default=4)
+    parser.add_argument("--lora-alpha", type=int, default=4)
     return parser.parse_args()
 
 
