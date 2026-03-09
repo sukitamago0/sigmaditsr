@@ -43,7 +43,7 @@ class PixArtSigmaSR(PixArtMS):
             self.out_channels = int(out_channels)
             head_hidden = self.x_embedder.proj.out_channels
             self.final_layer = T2IFinalLayer(head_hidden, self.patch_size, self.out_channels)
-            nn.init.constant_(self.final_layer.linear.weight, 0)
+            nn.init.trunc_normal_(self.final_layer.linear.weight, std=0.02)
             nn.init.constant_(self.final_layer.linear.bias, 0)
         self.depth = len(self.blocks)
         self.hidden_size = self.x_embedder.proj.out_channels
@@ -99,10 +99,10 @@ class PixArtSigmaSR(PixArtMS):
         ])
 
         for lin in self.input_adaln:
-            nn.init.zeros_(lin.weight)
+            nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(lin.bias)
         for lin in self.input_res_proj:
-            nn.init.zeros_(lin.weight)
+            nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(lin.bias)
         # CSFT init policy: zero-impact output + non-zero gradient path.
         # - dw: identity-like init so dw(feat) is non-zero at step0.
@@ -113,7 +113,7 @@ class PixArtSigmaSR(PixArtMS):
             k_h, k_w = conv.kernel_size
             conv.weight.data[:, :, k_h // 2, k_w // 2] = 1.0
         for conv in self.csft_pw:
-            nn.init.zeros_(conv.weight)
+            nn.init.normal_(conv.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(conv.bias)
 
         # Semantic-detail cross-attention (late hooks only), zero-impact at init.
@@ -131,9 +131,9 @@ class PixArtSigmaSR(PixArtMS):
             self.sem_q[k] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
             self.sem_kv[k] = nn.Linear(self.hidden_size, self.hidden_size * 2, bias=True)
             self.sem_out[k] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-            nn.init.zeros_(self.sem_out[k].weight)
+            nn.init.normal_(self.sem_out[k].weight, mean=0.0, std=1e-3)
             nn.init.zeros_(self.sem_out[k].bias)
-            self.sem_gate[k] = nn.Parameter(torch.zeros(1))
+            self.sem_gate[k] = nn.Parameter(torch.full((1,), -4.0))
 
     def load_pretrained_weights_with_zero_init(self, state_dict):
         """Shape-aware checkpoint loading for Sigma base -> SR backbone adaptation.

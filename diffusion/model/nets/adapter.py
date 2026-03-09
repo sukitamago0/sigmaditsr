@@ -123,7 +123,7 @@ class MultiLevelAdapterV8(nn.Module):
                 nn.SiLU(),
                 nn.Conv2d(hidden_size, hidden_size, 1),
             )
-            nn.init.zeros_(head[-1].weight)
+            nn.init.normal_(head[-1].weight, mean=0.0, std=1e-3)
             nn.init.zeros_(head[-1].bias)
             self.heads[str(lid)] = head
 

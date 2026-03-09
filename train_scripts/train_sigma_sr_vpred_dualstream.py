@@ -237,7 +237,7 @@ STAGE_THRESH_A2B = 23.75
 STAGE_THRESH_B2C = 24.75
 
 # Prior-preserving selective adaptation: LoRA windows/ranks by stage block groups.
-ENABLE_LORA = False
+ENABLE_LORA = True
 LORA_STRUCT_RANK = 16   # blocks 4-11, attn + mlp_out
 LORA_TRANS_RANK = 8     # blocks 12-17, attn + mlp_out
 LORA_DETAIL_RANK = 4    # blocks 20-27, attn only
@@ -248,7 +248,8 @@ PHASE_RUNTIME_CFG = {
         "cond_drop_prob": 0.0,
         "concat_lr_drop_enabled": False,
         "concat_lr_drop_schedule": [(0, 0.0)],
-        "lr_consist_weight_max": 0.00,
+        "edge_grad_weight": 0.01,
+        "lr_consist_weight_max": 0.02,
         "enable_lpips": False,
     },
     "B": {
@@ -262,6 +263,7 @@ PHASE_RUNTIME_CFG = {
             (12000, 0.3),
             (20000, 0.1),
         ],
+        "edge_grad_weight": 0.02,
         "lr_consist_weight_max": 0.05,
         "enable_lpips": False,
     },
@@ -276,6 +278,7 @@ PHASE_RUNTIME_CFG = {
             (12000, 0.4),
             (20000, 0.1),
         ],
+        "edge_grad_weight": 0.02,
         "lr_consist_weight_max": 0.08,
         "enable_lpips": False,
     },
@@ -301,10 +304,11 @@ def get_phase_runtime_cfg(stage: str):
 def get_loss_weights(global_step, stage: str):
     runtime_cfg = get_phase_runtime_cfg(stage)
     lr_consist_weight_max = float(runtime_cfg['lr_consist_weight_max'])
+    edge_grad_weight = float(runtime_cfg.get('edge_grad_weight', EDGE_GRAD_WEIGHT))
     weights = {'mse': 1.0, 'latent_l1': L1_BASE_WEIGHT}
     # Main experiment: disable LPIPS / flat_hf for structure-first fidelity.
     weights['lpips'] = 0.0
-    weights['edge_grad'] = EDGE_GRAD_WEIGHT
+    weights['edge_grad'] = edge_grad_weight
     weights['flat_hf'] = 0.0
     weights['lr_cons'] = lr_consist_weight_max if USE_LR_CONSISTENCY else 0.0
     return weights
@@ -706,8 +710,6 @@ def validate_schedule_alignment():
 def validate_s2d_decoupling():
     if DUALSTREAM_ENABLED:
         raise ValueError("S2D requires DUALSTREAM_ENABLED=False (no LR direct late-stream injection).")
-    if ENABLE_LORA:
-        raise ValueError("S2D refactor freezes backbone; set ENABLE_LORA=False.")
 
 def load_resume_injection_config(default_cfg: dict):
     cfg = dict(default_cfg)
@@ -1334,6 +1336,8 @@ class StageController:
         self.hit_count = 0
         self.smoothed_psnr = None
         self.should_advance = False
+        self.baseline_psnr = None
+        self.dynamic_threshold_initialized = False
 
     def state_dict(self):
         return {
@@ -1345,6 +1349,8 @@ class StageController:
             'psnr_history': list(self.psnr_history),
             'hit_count': int(self.hit_count),
             'smoothed_psnr': None if self.smoothed_psnr is None else float(self.smoothed_psnr),
+            'baseline_psnr': None if self.baseline_psnr is None else float(self.baseline_psnr),
+            'dynamic_threshold_initialized': bool(self.dynamic_threshold_initialized),
         }
 
     def load_state_dict(self, sd: dict):
@@ -1358,6 +1364,22 @@ class StageController:
         self.psnr_history = [float(v) for v in sd.get('psnr_history', [])]
         self.hit_count = int(sd.get('hit_count', 0))
         self.smoothed_psnr = sd.get('smoothed_psnr', None)
+        self.baseline_psnr = sd.get('baseline_psnr', None)
+        if 'dynamic_threshold_initialized' in sd:
+            self.dynamic_threshold_initialized = bool(sd.get('dynamic_threshold_initialized', False))
+        else:
+            # Backward-compat: if checkpoint already stores thresholds, preserve them on resume.
+            self.dynamic_threshold_initialized = ('th_a2b' in sd) and ('th_b2c' in sd)
+
+    def maybe_init_dynamic_thresholds(self, baseline_psnr: float):
+        if self.dynamic_threshold_initialized:
+            return
+        self.baseline_psnr = float(baseline_psnr)
+        self.th_a2b = max(15.5, self.baseline_psnr + 1.0)
+        self.th_b2c = max(17.5, self.baseline_psnr + 2.5)
+        if self.th_b2c <= self.th_a2b:
+            self.th_b2c = self.th_a2b + 0.5
+        self.dynamic_threshold_initialized = True
 
     def _target_threshold(self):
         if self.current_stage == 'A':
@@ -1368,6 +1390,7 @@ class StageController:
 
     def update(self, val_psnr: float):
         self.should_advance = False
+        self.maybe_init_dynamic_thresholds(val_psnr)
         self.psnr_history.append(float(val_psnr))
         if len(self.psnr_history) > max(32, self.k * 4):
             self.psnr_history = self.psnr_history[-max(32, self.k * 4):]
@@ -1455,17 +1478,17 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     optim_groups = []
     if len(dual_params) > 0:
-        optim_groups.append({"params": dual_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": dual_params, "lr": 3e-4, "weight_decay": 0.01})
     if len(adapter_params) > 0:
-        optim_groups.append({"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
     if len(inject_gate_params) > 0:
-        optim_groups.append({"params": inject_gate_params, "lr": 1e-4, "weight_decay": 0.0})
+        optim_groups.append({"params": inject_gate_params, "lr": 3e-4, "weight_decay": 0.0})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
     if len(final_head_params) > 0:
-        optim_groups.append({"params": final_head_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": final_head_params, "lr": 3e-4, "weight_decay": 0.01})
     if len(csft_params) > 0:
-        optim_groups.append({"params": csft_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": csft_params, "lr": 3e-4, "weight_decay": 0.01})
     if len(other_pixart_params) > 0:
         optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
     if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
@@ -1495,6 +1518,34 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         "adapter": len(adapter_params),
     }
     return optimizer, params_to_clip, group_counts
+
+
+def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module):
+    if step > 200 or (step % 50 != 0):
+        return
+    pix_named = dict(pixart.named_parameters())
+    ad_named = dict(adapter.named_parameters())
+    watched = [
+        ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
+        ("pixart.input_res_proj.0.weight", pix_named.get("input_res_proj.0.weight", None)),
+        ("pixart.input_adaln.0.weight", pix_named.get("input_adaln.0.weight", None)),
+        ("adapter.heads.2.2.weight", ad_named.get("heads.2.2.weight", None)),
+        ("pixart.sem_out.14.weight", pix_named.get("sem_out.14.weight", None)),
+    ]
+    msg = [f"[GradSanity][step={step}]"]
+    warnings = []
+    for name, p in watched:
+        if p is None:
+            msg.append(f"{name}=N/A")
+            continue
+        w_norm = float(p.detach().float().norm().item())
+        g_norm = 0.0 if p.grad is None else float(p.grad.detach().float().norm().item())
+        msg.append(f"{name}: g={g_norm:.3e}, w={w_norm:.3e}")
+        if g_norm < 1e-12:
+            warnings.append(name)
+    print(" | ".join(msg))
+    if warnings:
+        print(f"⚠️ [GradSanity] near-zero grad on critical paths: {warnings}")
 
 
 def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_keys: set):
@@ -2196,7 +2247,7 @@ def main():
 
                 need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0) or (w.get('lr_cons', 0.0) > 0)
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
-                allow_by_stage = (current_stage in ("B", "C"))
+                allow_by_stage = (current_stage in ("A", "B", "C"))
                 pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
                 calc_pixel_loss = need_pixel_loss and allow_by_stage and (pixel_loss_num_samples > 0)
 
@@ -2248,6 +2299,7 @@ def main():
             accum_micro_steps += 1
 
             if accum_micro_steps == GRAD_ACCUM_STEPS:
+                log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -2285,6 +2337,7 @@ def main():
                 })
 
         if accum_micro_steps > 0 and not reached_max_steps:
+            log_critical_path_gradients(step + 1, pixart, adapter)
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
             optimizer.zero_grad()
