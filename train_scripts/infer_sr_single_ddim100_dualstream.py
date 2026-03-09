@@ -40,11 +40,8 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 
 
 
-def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
-    h, w = lr_m11.shape[-2:]
-    if max(h, w) <= 160:
-        return lr_m11.float().clamp(-1.0, 1.0)
-    return F.interpolate(lr_m11.float(), size=(h // 4, w // 4), mode='bicubic', align_corners=False, antialias=True).clamp(-1.0, 1.0)
+def build_adapter_struct_input(lr_small_m11: torch.Tensor) -> torch.Tensor:
+    return lr_small_m11.float().clamp(-1.0, 1.0)
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None:
@@ -201,8 +198,14 @@ def run(args):
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
 
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
-    ckpt_lora_rank = int(ckpt.get("lora_rank", args.lora_rank))
-    ckpt_lora_alpha = int(ckpt.get("lora_alpha", ckpt_lora_rank))
+    if "lora_rank" in ckpt:
+        ckpt_lora_rank = int(ckpt["lora_rank"])
+    else:
+        ckpt_lora_rank = int(args.lora_rank)
+    if "lora_alpha" in ckpt:
+        ckpt_lora_alpha = int(ckpt["lora_alpha"])
+    else:
+        ckpt_lora_alpha = int(args.lora_alpha)
     if has_lora:
         apply_lora(pixart, rank=ckpt_lora_rank, alpha=ckpt_lora_alpha)
 
@@ -236,7 +239,13 @@ def run(args):
     lr_pil = lr_pil.resize((args.crop_size, args.crop_size), Image.BICUBIC)
     to_tensor = transforms.ToTensor()
     norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
-    lr = norm(to_tensor(lr_pil)).unsqueeze(0).to(device)
+    lr_in = norm(to_tensor(lr_pil)).unsqueeze(0).to(device)
+    if args.input_is_lr_small:
+        lr_small = lr_in
+        lr = F.interpolate(lr_small, size=(args.crop_size, args.crop_size), mode="bicubic", align_corners=False, antialias=True)
+    else:
+        lr = lr_in
+        lr_small = F.interpolate(lr, size=(args.crop_size // 4, args.crop_size // 4), mode="bicubic", align_corners=False, antialias=True)
 
     z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
     gen = torch.Generator(device=device)
@@ -251,7 +260,7 @@ def run(args):
         latents = randn_like_with_generator(z_lr.to(compute_dtype), gen)
         run_timesteps = scheduler.timesteps
 
-    adapter_in = build_adapter_struct_input(lr).to(device=device, dtype=torch.float32)
+    adapter_in = build_adapter_struct_input(lr_small).to(device=device, dtype=torch.float32)
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
     for t in run_timesteps:
@@ -329,6 +338,7 @@ def parse_args():
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=int, default=4)
+    parser.add_argument("--input_is_lr_small", type=lambda x: str(x).lower() in ("1","true","yes","y"), default=True)
     return parser.parse_args()
 
 
