@@ -15,7 +15,7 @@ from torchvision import transforms
 from PIL import Image
 from diffusers import AutoencoderKL, DDIMScheduler
 
-from diffusion.model.nets.PixArtSigma_SR_dualstream import PixArtSigmaSRDualStream_XL_2
+from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
 
 
@@ -41,18 +41,8 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 
 
 def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
-    # 4ch structural-only input: [GaussianLowpass(gray), gray, SobelMag, |Laplacian|]
-    img01 = (lr_m11.float() + 1.0) * 0.5
-    gray = 0.299 * img01[:, 0:1] + 0.587 * img01[:, 1:2] + 0.114 * img01[:, 2:3]
-    sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], device=gray.device, dtype=gray.dtype)
-    sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], device=gray.device, dtype=gray.dtype)
-    lap = torch.tensor([[[[0, 1, 0], [1, -4, 1], [0, 1, 0]]]], device=gray.device, dtype=gray.dtype)
-    gx = F.conv2d(gray, sobel_x, padding=1)
-    gy = F.conv2d(gray, sobel_y, padding=1)
-    sobel_mag = torch.sqrt(gx * gx + gy * gy + 1e-6)
-    lap_abs = F.conv2d(gray, lap, padding=1).abs()
-    lowpass = F.avg_pool2d(gray, kernel_size=7, stride=1, padding=3)
-    return torch.cat([lowpass, gray, sobel_mag, lap_abs], dim=1).clamp(0.0, 1.0)
+    h, w = lr_m11.shape[-2:]
+    return F.interpolate(lr_m11.float(), size=(h // 4, w // 4), mode='bicubic', align_corners=False, antialias=True).clamp(-1.0, 1.0)
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None:
@@ -169,20 +159,20 @@ def run(args):
     transition_layers = list(inj_cfg.get("transition_layers", []))
     detail_layers = list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24]))
 
-    pixart = PixArtSigmaSRDualStream_XL_2(
+    pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
         sparse_inject_ratio=1.0,
-        injection_cutoff_layer=injection_cutoff_layer,
-        injection_strategy=injection_strategy,
-        hard_injection_layers=hard_layers,
-        transition_injection_layers=transition_layers,
-        detail_injection_layers=detail_layers,
-        injection_r_end=0.1,
-        injection_s_min=0.1,
-        injection_s_max=1.0,
-        injection_init_p=2.0,
+        
+        
+        
+        
+        
+        
+        
+        
+        
         dualstream_enabled=False,
         cross_attn_start_layer=16,
         dual_num_heads=16,
@@ -258,7 +248,7 @@ def run(args):
         run_timesteps = scheduler.timesteps
 
     adapter_in = build_adapter_struct_input(lr).to(dtype=torch.float32)
-    cond = adapter(adapter_in, sem_image=lr, return_style=False)
+    cond = adapter(adapter_in, t_embed=None)
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
     for t in run_timesteps:
@@ -276,8 +266,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                    injection_mode="hybrid",
-                    force_drop_ids=drop_cond,
+                                        force_drop_ids=drop_cond,
                 )
             else:
                 cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=device))
@@ -289,8 +278,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond_zero,
-                    injection_mode="hybrid",
-                    force_drop_ids=drop_uncond,
+                                        force_drop_ids=drop_uncond,
                 )
                 out_cond = pixart(
                     x=model_in,
@@ -300,8 +288,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                    injection_mode="hybrid",
-                    force_drop_ids=drop_cond,
+                                        force_drop_ids=drop_cond,
                 )
                 out = out_uncond + args.cfg_scale * (out_cond - out_uncond)
 

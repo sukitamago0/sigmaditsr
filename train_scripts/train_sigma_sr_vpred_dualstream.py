@@ -44,7 +44,7 @@ from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # [Import V8 Model]
-from diffusion.model.nets.PixArtSigma_SR_dualstream import PixArtSigmaSRDualStream_XL_2
+from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
@@ -119,8 +119,8 @@ GRAD_ACCUM_STEPS = 16
 NUM_WORKERS = 8
 
 LR_BASE = 1e-5 
-LORA_RANK = 16
-LORA_ALPHA = 16
+LORA_RANK = 4
+LORA_ALPHA = 4
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -425,17 +425,9 @@ def edge_guided_losses(pred_m11: torch.Tensor, gt_m11: torch.Tensor, q: float = 
 
 @torch.cuda.amp.autocast(enabled=False)
 def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
-    # 4ch structural-only input: [GaussianLowpass(gray), gray, SobelMag, |Laplacian|]
-    gray = _to_luma01(lr_m11)
-    kx = _SOBEL_X.to(device=gray.device)
-    ky = _SOBEL_Y.to(device=gray.device)
-    kl = _LAPLACE.to(device=gray.device)
-    gx = F.conv2d(gray, kx, padding=1)
-    gy = F.conv2d(gray, ky, padding=1)
-    sobel_mag = torch.sqrt(gx * gx + gy * gy + 1e-6)
-    lap_abs = F.conv2d(gray, kl, padding=1).abs()
-    lowpass = F.avg_pool2d(gray, kernel_size=7, stride=1, padding=3)
-    return torch.cat([lowpass, gray, sobel_mag, lap_abs], dim=1).clamp(0.0, 1.0)
+    # New adapter input is lr_small in RGB pixel space.
+    h, w = lr_m11.shape[-2:]
+    return F.interpolate(lr_m11.float(), size=(h // 4, w // 4), mode='bicubic', align_corners=False, antialias=True).clamp(-1.0, 1.0)
 
 
 @torch.cuda.amp.autocast(enabled=False)
@@ -1186,22 +1178,14 @@ def _block_id_from_name(name: str):
 
 
 def _lora_target_kind(module_name: str):
-    attn_keys = ("qkv", "proj", "to_q", "to_k", "to_v", "q_linear", "kv_linear")
-    mlp_out_keys = ("mlp.fc2", "ff.net.2", "mlp.proj", "mlp.2")
-    if any(k in module_name for k in attn_keys):
+    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
         return "attn"
-    if any(k in module_name for k in mlp_out_keys):
-        return "mlp_out"
     return None
 
 
 def _lora_rank_for_block(block_id: int, kind: str):
-    if 4 <= block_id <= 11:
-        return LORA_STRUCT_RANK if kind in ("attn", "mlp_out") else None
-    if 12 <= block_id <= 17:
-        return LORA_TRANS_RANK if kind in ("attn", "mlp_out") else None
-    if 20 <= block_id <= 27:
-        return LORA_DETAIL_RANK if kind == "attn" else None
+    if 0 <= block_id <= 27 and kind == "attn":
+        return 4
     return None
 
 
@@ -1226,31 +1210,15 @@ def apply_lora(model):
     print(f"✅ Windowed LoRA applied to {cnt} layers.")
 
 
-def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = True, train_stage: str = "C"):
-    train_stage = str(train_stage).upper()
+def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False, train_stage: str = "C"):
+    train_stage = "C"
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
 
     # Default: freeze all, then selectively unfreeze task-relevant modules.
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = [
-        "aug_embedder",
-        "final_layer",
-        "input_adaln",
-        "input_res_proj",
-        "alpha_struct",
-        "alpha_trans",
-        "alpha_detail",
-        "injection_scales",
-        "csft_dw",
-        "csft_pw",
-        "sem_norm",
-        "sem_q",
-        "sem_kv",
-        "sem_out",
-        "sem_gate",
-    ]
+    always_train_keywords = ["final_layer", "input_adaln", "input_res_proj", "inject_gate"]
     if train_x_embedder:
         always_train_keywords.append("x_embedder")
     if DUALSTREAM_ENABLED:
@@ -1481,18 +1449,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": dual_params, "lr": 3e-4, "weight_decay": 0.01})
     if len(adapter_params) > 0:
         optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(inject_gate_params) > 0:
-        optim_groups.append({"params": inject_gate_params, "lr": 3e-4, "weight_decay": 0.0})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
     if len(final_head_params) > 0:
-        optim_groups.append({"params": final_head_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(csft_params) > 0:
-        optim_groups.append({"params": csft_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(other_pixart_params) > 0:
-        optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
-    if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": final_head_params + other_pixart_params, "lr": 3e-4, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
@@ -1917,7 +1877,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             
             adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, sem_image=lr, return_style=USE_STYLE_FUSION)
+                cond = adapter(adapter_in, t_embed=None)
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
@@ -1927,8 +1887,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, injection_mode="hybrid", force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond)
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond)
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
@@ -2037,7 +1997,7 @@ def main():
         "detail_layers": list(DETAIL_INJECTION_LAYERS),
     })
 
-    pixart = PixArtSigmaSRDualStream_XL_2(
+    pixart = PixArtSigmaSR_XL_2(
         input_size=64, in_channels=4, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=int(inj_cfg["injection_cutoff_layer"]), injection_strategy=str(inj_cfg["injection_strategy"]),
         hard_injection_layers=list(inj_cfg["hard_layers"]),
@@ -2195,7 +2155,7 @@ def main():
 
             adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, sem_image=lr, return_style=USE_STYLE_FUSION) # Adapter sees image-domain structure guidance
+                cond = adapter(adapter_in, t_embed=None) # Adapter sees image-domain structure guidance
             cond_in = cond
             cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
@@ -2204,7 +2164,7 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in)
                 kwargs["force_drop_ids"] = drop_uncond
 
                 out = pixart(**kwargs)
@@ -2237,7 +2197,7 @@ def main():
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
-                w = get_loss_weights(step, current_stage)
+                w = {'mse':1.0,'latent_l1':0.10,'lpips':0.0,'edge_grad':0.01,'flat_hf':0.0,'lr_cons':0.05}
                 
                 # Calculate pixel-space losses
                 loss_edge = torch.tensor(0.0, device=DEVICE)
