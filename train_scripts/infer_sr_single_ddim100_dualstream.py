@@ -126,6 +126,22 @@ def apply_lora(model, rank=16, alpha=16):
     print(f"✅ LoRA applied to {cnt} layers.")
 
 
+
+
+def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context: str = "load"):
+    curr = model.state_dict()
+    filt = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in curr and tuple(v.shape) == tuple(curr[k].shape):
+            filt[k] = v
+        else:
+            skipped.append(k)
+    missing, unexpected = model.load_state_dict(filt, strict=False)
+    print(f"[{context}] compatible load: loaded={len(filt)}, skipped_shape_or_missing={len(skipped)}, missing={len(missing)}, unexpected={len(unexpected)}")
+    if len(skipped) > 0:
+        print(f"[{context}] skipped examples: {skipped[:5]}")
+    return missing, unexpected, skipped
 def _load_pixart_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
     saved = set(saved_trainable.keys())
     model_keys = set(pixart.state_dict().keys())
@@ -187,7 +203,7 @@ def run(args):
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
     else:
-        pixart.load_state_dict(base, strict=False)
+        load_state_dict_shape_compatible(pixart, base, context="infer-base-pretrain")
 
     adapter = build_adapter_v7(
         in_channels=4,

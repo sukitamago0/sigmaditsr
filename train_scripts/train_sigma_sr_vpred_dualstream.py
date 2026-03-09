@@ -1429,6 +1429,22 @@ def save_smart(
                         pass
     return next_best_records if save_as_best else best_records
 
+
+
+def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context: str = "load"):
+    curr = model.state_dict()
+    filt = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in curr and tuple(v.shape) == tuple(curr[k].shape):
+            filt[k] = v
+        else:
+            skipped.append(k)
+    missing, unexpected = model.load_state_dict(filt, strict=False)
+    print(f"[{context}] compatible load: loaded={len(filt)}, skipped_shape_or_missing={len(skipped)}, missing={len(missing)}, unexpected={len(unexpected)}")
+    if len(skipped) > 0:
+        print(f"[{context}] skipped examples: {skipped[:5]}")
+    return missing, unexpected, skipped
 def _load_pixart_trainable_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
     saved = set(saved_trainable.keys())
     model_keys = set(pixart.state_dict().keys())
@@ -1755,8 +1771,8 @@ def main():
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
     else:
-        missing, unexpected = pixart.load_state_dict(base, strict=False)
-        print(f"[Load] missing={len(missing)} unexpected={len(unexpected)}")
+        missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+        print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
     if ENABLE_LORA:
         apply_lora(pixart)
     else:
