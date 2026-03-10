@@ -1,0 +1,515 @@
+import os
+import sys
+import glob
+import math
+import argparse
+from pathlib import Path
+
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from torchvision import transforms
+from torchvision.transforms import functional as TF
+from PIL import Image
+import lpips
+from diffusers import AutoencoderKL, DDIMScheduler
+from torchmetrics.functional import peak_signal_noise_ratio as psnr
+from torchmetrics.functional import structural_similarity_index_measure as ssim
+import matplotlib.pyplot as plt
+
+from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
+from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.gaussian_diffusion import GaussianDiffusion
+
+
+# ============================== Interpretation Guide ==============================
+# 1) Whole-image overfit:
+#    - If train loss decreases and full-image PSNR/SSIM rise while LPIPS drops,
+#      the model is fitting this sample globally.
+# 2) ROI overfit:
+#    - If ROI metrics improve significantly faster than full-image metrics,
+#      capacity is focusing on local detail restoration (expected for tiny ROI).
+# 3) Adapter on/off comparison (--disable_adapter):
+#    - ON: conditioning path includes adapter tokens from paired lr_small patches.
+#    - OFF: conditioning path is disabled (adapter not used/trained).
+#    - If ON >> OFF in ROI/full metrics, gains are genuinely from adapter guidance.
+# ===============================================================================
+
+
+def seed_everything(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def rgb01_to_y01(rgb01):
+    r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
+    return (16.0 + 65.481 * r + 128.553 * g + 24.966 * b) / 255.0
+
+
+def parse_roi(roi_str):
+    if roi_str is None or str(roi_str).strip() == "":
+        return None
+    vals = [int(x.strip()) for x in roi_str.split(",")]
+    if len(vals) != 4:
+        raise ValueError("--roi must be x1,y1,x2,y2")
+    x1, y1, x2, y2 = vals
+    if not (x2 > x1 and y2 > y1):
+        raise ValueError("ROI must satisfy x2>x1 and y2>y1")
+    return x1, y1, x2, y2
+
+
+def clamp_roi_to_hw(roi, h, w):
+    if roi is None:
+        return None
+    x1, y1, x2, y2 = roi
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(1, min(w, x2))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(1, min(h, y2))
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("ROI is invalid after clamping")
+    return x1, y1, x2, y2
+
+
+def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context: str = "load"):
+    curr = model.state_dict()
+    filt, skipped = {}, []
+    for k, v in state_dict.items():
+        if k in curr and tuple(v.shape) == tuple(curr[k].shape):
+            filt[k] = v
+        else:
+            skipped.append(k)
+    missing, unexpected = model.load_state_dict(filt, strict=False)
+    print(f"[{context}] compatible load: loaded={len(filt)}, skipped={len(skipped)}, missing={len(missing)}, unexpected={len(unexpected)}")
+    return missing, unexpected, skipped
+
+
+def _load_pixart_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
+    curr = pixart.state_dict()
+    loaded = skipped_shape = missing_in_model = 0
+    for k, v in saved_trainable.items():
+        if k not in curr:
+            missing_in_model += 1
+            continue
+        if tuple(v.shape) == tuple(curr[k].shape):
+            curr[k] = v.to(dtype=curr[k].dtype)
+            loaded += 1
+        else:
+            skipped_shape += 1
+    pixart.load_state_dict(curr, strict=False)
+    print(f"[{context}] pixart subset load: loaded={loaded}, model_miss={missing_in_model}, shape_skip={skipped_shape}, saved_total={len(saved_trainable)}")
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r: int, alpha: float):
+        super().__init__()
+        self.base = base
+        self.scaling = alpha / r
+        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
+        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
+        self.lora_A.to(base.weight.device)
+        self.lora_B.to(base.weight.device)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+
+    def forward(self, x):
+        out = self.base(x)
+        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
+        return out + delta.to(out.dtype)
+
+
+def _block_id_from_name(name: str):
+    import re
+    m = re.search(r"blocks\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+
+
+def apply_lora_attn_only(model, rank=4, alpha=4):
+    cnt = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        bid = _block_id_from_name(name)
+        if bid is None or not (0 <= bid <= 27):
+            continue
+        if not (("attn.qkv" in name) or ("attn.proj" in name)):
+            continue
+        parent = model.get_submodule(name.rsplit('.', 1)[0])
+        child = name.rsplit('.', 1)[1]
+        setattr(parent, child, LoRALinear(module, rank, alpha))
+        cnt += 1
+    print(f"✅ Attention LoRA applied to {cnt} layers (rank={rank}, alpha={alpha}).")
+
+
+def center_crop_aligned_pair(lr_pil: Image.Image, hr_pil: Image.Image, scale: int = 4):
+    wl, hl = lr_pil.size
+    wh, hh = hr_pil.size
+    h2 = min(hh, hl * scale)
+    w2 = min(wh, wl * scale)
+    h2 = (h2 // scale) * scale
+    w2 = (w2 // scale) * scale
+    if h2 <= 0 or w2 <= 0:
+        raise ValueError(f"Invalid aligned size with LR={lr_pil.size}, HR={hr_pil.size}")
+    hr_top = (hh - h2) // 2
+    hr_left = (wh - w2) // 2
+    lr_h2 = h2 // scale
+    lr_w2 = w2 // scale
+    lr_top = (hl - lr_h2) // 2
+    lr_left = (wl - lr_w2) // 2
+    hr_aligned = TF.crop(hr_pil, hr_top, hr_left, h2, w2)
+    lr_aligned = TF.crop(lr_pil, lr_top, lr_left, lr_h2, lr_w2)
+    return lr_aligned, hr_aligned
+
+
+class SingleRealSROverfitDataset(Dataset):
+    """Return fields exactly aligned with main training: hr/lr/lr_small/path."""
+    def __init__(self, roots, pick_index=0, roi=None):
+        self.norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
+        self.to_tensor = transforms.ToTensor()
+        self.pairs = []
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            for hr_path in sorted(glob.glob(os.path.join(root, "*_HR.png"))):
+                lr_path = hr_path.replace("_HR.png", "_LR4.png")
+                if os.path.exists(lr_path):
+                    self.pairs.append((hr_path, lr_path))
+        self.pairs = sorted(self.pairs)
+        if len(self.pairs) == 0:
+            raise FileNotFoundError(f"No RealSR pairs found in roots={roots}")
+        if not (0 <= int(pick_index) < len(self.pairs)):
+            raise IndexError(f"pick_index={pick_index} out of range [0,{len(self.pairs)-1}]")
+        self.pick_index = int(pick_index)
+        self.roi = roi
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        del idx
+        hr_path, lr_path = self.pairs[self.pick_index]
+        hr_pil = Image.open(hr_path).convert("RGB")
+        lr_pil = Image.open(lr_path).convert("RGB")
+        lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=4)
+
+        hr_w, hr_h = hr_aligned.size
+        if self.roi is None:
+            hr_crop = hr_aligned
+            lr_small_pil = lr_aligned
+        else:
+            x1, y1, x2, y2 = clamp_roi_to_hw(self.roi, hr_h, hr_w)
+            hr_crop = TF.crop(hr_aligned, y1, x1, y2 - y1, x2 - x1)
+            lx1, ly1 = x1 // 4, y1 // 4
+            lx2, ly2 = math.ceil(x2 / 4), math.ceil(y2 / 4)
+            lr_w, lr_h = lr_aligned.size
+            lx1 = max(0, min(lr_w - 1, lx1))
+            ly1 = max(0, min(lr_h - 1, ly1))
+            lx2 = max(lx1 + 1, min(lr_w, lx2))
+            ly2 = max(ly1 + 1, min(lr_h, ly2))
+            lr_small_pil = TF.crop(lr_aligned, ly1, lx1, ly2 - ly1, lx2 - lx1)
+
+        hr_h, hr_w = hr_crop.size[1], hr_crop.size[0]
+        lr_up_pil = TF.resize(lr_small_pil, (hr_h, hr_w), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+
+        hr_tensor = self.norm(self.to_tensor(hr_crop))
+        lr_tensor = self.norm(self.to_tensor(lr_up_pil))
+        lr_small_tensor = self.norm(self.to_tensor(lr_small_pil))
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
+
+
+def randn_like_with_generator(tensor, generator):
+    return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
+
+
+def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
+    strength = float(max(0.0, min(1.0, strength)))
+    scheduler.set_timesteps(steps, device=z_lr.device)
+    timesteps = scheduler.timesteps
+    start_index = int(round(strength * (len(timesteps) - 1)))
+    start_index = min(max(start_index, 0), len(timesteps) - 1)
+    t_start = timesteps[start_index]
+    noise = randn_like_with_generator(z_lr, generator)
+    latents = scheduler.add_noise(z_lr, noise, t_start) if hasattr(scheduler, "add_noise") else (z_lr + noise)
+    return latents.to(dtype=dtype), timesteps[start_index:]
+
+
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    if not torch.is_tensor(arr):
+        arr = torch.tensor(arr, dtype=torch.float32, device=timesteps.device)
+    out = arr.to(device=timesteps.device)[timesteps].float()
+    while len(out.shape) < len(broadcast_shape):
+        out = out[..., None]
+    return out.expand(broadcast_shape)
+
+
+@torch.no_grad()
+def run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_info, args, device, compute_dtype):
+    scheduler = DDIMScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.0001,
+        beta_end=0.02,
+        beta_schedule="linear",
+        clip_sample=False,
+        prediction_type="v_prediction",
+        set_alpha_to_one=False,
+    )
+    scheduler.set_timesteps(args.infer_steps, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(args.seed)
+
+    z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
+    z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
+    if args.use_lq_init:
+        latents, run_timesteps = get_lq_init_latents(z_lr.to(compute_dtype), scheduler, args.infer_steps, gen, args.lq_init_strength, compute_dtype)
+    else:
+        latents = randn_like_with_generator(z_hr.to(compute_dtype), gen)
+        run_timesteps = scheduler.timesteps
+
+    aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
+    for t in run_timesteps:
+        t_b = torch.tensor([t], device=device).expand(latents.shape[0])
+        with torch.no_grad():
+            t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
+        cond = None
+        if not args.disable_adapter:
+            with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
+                cond = adapter(lr_small.to(dtype=compute_dtype), t_embed=t_embed)
+
+        with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
+            out = pixart(
+                x=latents.to(compute_dtype), timestep=t_b, y=y_embed,
+                aug_level=aug_level, mask=None, data_info=data_info,
+                adapter_cond=cond, force_drop_ids=torch.ones(latents.shape[0], device=device)
+            )
+        latents = scheduler.step(out.float(), t, latents.float()).prev_sample
+
+    pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
+    pred01 = (pred + 1.0) * 0.5
+    hr01 = (hr + 1.0) * 0.5
+
+    py = rgb01_to_y01(pred01)[..., 4:-4, 4:-4]
+    hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
+    m_psnr = float(psnr(py, hy, data_range=1.0).item())
+    m_ssim = float(ssim(py, hy, data_range=1.0).item())
+
+    lpips_fn = lpips.LPIPS(net='vgg').to("cpu").eval()
+    for p in lpips_fn.parameters():
+        p.requires_grad_(False)
+    m_lpips = float(lpips_fn(pred.detach().cpu().float(), hr.detach().cpu().float()).mean().item())
+
+    roi_metrics = None
+    if args.roi is not None:
+        x1, y1, x2, y2 = args.roi
+        pr_roi = pred01[..., y1:y2, x1:x2]
+        hr_roi = hr01[..., y1:y2, x1:x2]
+        pry = rgb01_to_y01(pr_roi)
+        hry = rgb01_to_y01(hr_roi)
+        roi_metrics = {
+            "psnr": float(psnr(pry, hry, data_range=1.0).item()),
+            "ssim": float(ssim(pry, hry, data_range=1.0).item()),
+            "lpips": float(lpips_fn((pr_roi * 2 - 1).detach().cpu().float(), (hr_roi * 2 - 1).detach().cpu().float()).mean().item()),
+        }
+
+    return pred, {"full": {"psnr": m_psnr, "ssim": m_ssim, "lpips": m_lpips}, "roi": roi_metrics}
+
+
+def save_visuals(out_dir, step, hr, lr, pred, roi):
+    os.makedirs(out_dir, exist_ok=True)
+    hr_np = (hr[0].detach().cpu().float().permute(1, 2, 0).numpy() + 1.0) * 0.5
+    lr_np = (lr[0].detach().cpu().float().permute(1, 2, 0).numpy() + 1.0) * 0.5
+    pr_np = (pred[0].detach().cpu().float().permute(1, 2, 0).numpy() + 1.0) * 0.5
+
+    fig = plt.figure(figsize=(12, 4))
+    for i, (img, t) in enumerate([(lr_np, "LR(up)"), (hr_np, "HR GT"), (pr_np, "Pred")], start=1):
+        ax = plt.subplot(1, 3, i)
+        ax.imshow(np.clip(img, 0, 1))
+        ax.set_title(t)
+        ax.axis("off")
+    fig.savefig(os.path.join(out_dir, f"step_{step:06d}_full_triptych.png"), bbox_inches="tight")
+    plt.close(fig)
+
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        hr_roi = hr_np[y1:y2, x1:x2]
+        pr_roi = pr_np[y1:y2, x1:x2]
+        er = np.mean(np.abs(pr_roi - hr_roi), axis=2)
+        er = er / (er.max() + 1e-8)
+
+        fig = plt.figure(figsize=(14, 4))
+        ax1 = plt.subplot(1, 4, 1); ax1.imshow(np.clip(hr_roi, 0, 1)); ax1.set_title("ROI GT"); ax1.axis("off")
+        ax2 = plt.subplot(1, 4, 2); ax2.imshow(np.clip(pr_roi, 0, 1)); ax2.set_title("ROI Pred"); ax2.axis("off")
+        ax3 = plt.subplot(1, 4, 3); ax3.imshow(np.clip(np.abs(pr_roi - hr_roi), 0, 1)); ax3.set_title("ROI |Err| RGB"); ax3.axis("off")
+        ax4 = plt.subplot(1, 4, 4); im = ax4.imshow(er, cmap="jet", vmin=0.0, vmax=1.0); ax4.set_title("ROI Error Heatmap"); ax4.axis("off")
+        fig.colorbar(im, ax=ax4, fraction=0.046, pad=0.04)
+        fig.savefig(os.path.join(out_dir, f"step_{step:06d}_roi_quad.png"), bbox_inches="tight")
+        plt.close(fig)
+
+
+def configure_trainable(pixart, adapter, disable_adapter=False):
+    for _, p in pixart.named_parameters():
+        p.requires_grad_(False)
+    for _, p in adapter.named_parameters():
+        p.requires_grad_(False)
+
+    allow = ["final_layer", "input_adaln", "input_res_proj", "inject_gate", "cond_route_logits", "lora_A", "lora_B"]
+    for n, p in pixart.named_parameters():
+        if any(k in n for k in allow):
+            p.requires_grad_(True)
+
+    if not disable_adapter:
+        for _, p in adapter.named_parameters():
+            p.requires_grad_(True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pixart_path", type=str, required=True)
+    parser.add_argument("--vae_path", type=str, required=True)
+    parser.add_argument("--null_t5_embed_path", type=str, required=True)
+    parser.add_argument("--ckpt_path", type=str, default="")
+    parser.add_argument("--realsr_roots", type=str, default="/data/RealSR/Nikon/Test/4,/data/RealSR/Canon/Test/4")
+    parser.add_argument("--pick_index", type=int, default=0)
+    parser.add_argument("--roi", type=str, default="")
+    parser.add_argument("--disable_adapter", action="store_true")
+    parser.add_argument("--train_steps", type=int, default=400)
+    parser.add_argument("--save_every", type=int, default=50)
+    parser.add_argument("--infer_steps", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--lora_rank", type=int, default=4)
+    parser.add_argument("--lora_alpha", type=int, default=4)
+    parser.add_argument("--use_lq_init", action="store_true", default=True)
+    parser.add_argument("--lq_init_strength", type=float, default=0.5)
+    parser.add_argument("--out_dir", type=str, default="outputs/overfit_single_realsr")
+    args = parser.parse_args()
+
+    seed_everything(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    roi = parse_roi(args.roi)
+    roots = [x.strip() for x in args.realsr_roots.split(",") if x.strip()]
+    ds = SingleRealSROverfitDataset(roots=roots, pick_index=args.pick_index, roi=roi)
+    batch = ds[0]
+
+    hr = batch["hr"].unsqueeze(0).to(device)
+    lr = batch["lr"].unsqueeze(0).to(device)
+    lr_small = batch["lr_small"].unsqueeze(0).to(device)
+
+    h, w = hr.shape[-2:]
+    roi = clamp_roi_to_hw(roi, h, w) if roi is not None else None
+    args.roi = roi
+
+    pixart = PixArtSigmaSR_XL_2(input_size=64, in_channels=4, out_channels=4).to(device)
+    base = torch.load(args.pixart_path, map_location="cpu")
+    if "state_dict" in base:
+        base = base["state_dict"]
+    if "pos_embed" in base:
+        del base["pos_embed"]
+    if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
+        pixart.load_pretrained_weights_with_zero_init(base)
+    else:
+        load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+
+    adapter = build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(device).float()
+
+    if args.ckpt_path and os.path.exists(args.ckpt_path):
+        ckpt = torch.load(args.ckpt_path, map_location="cpu")
+        saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
+        has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
+        lora_rank = int(ckpt["lora_rank"]) if "lora_rank" in ckpt else int(args.lora_rank)
+        lora_alpha = int(ckpt["lora_alpha"]) if "lora_alpha" in ckpt else int(args.lora_alpha)
+        if has_lora:
+            apply_lora_attn_only(pixart, rank=lora_rank, alpha=lora_alpha)
+        _load_pixart_subset_compatible(pixart, saved_trainable, context="overfit")
+        if "adapter" in ckpt:
+            load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="overfit-adapter")
+    else:
+        apply_lora_attn_only(pixart, rank=args.lora_rank, alpha=args.lora_alpha)
+
+    vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
+    vae.enable_slicing()
+    null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
+    y_embed = null_pack["y"].to(device)
+    data_info = {
+        "img_hw": torch.tensor([[float(h), float(w)]], device=device),
+        "aspect_ratio": torch.tensor([float(w) / float(h)], device=device),
+    }
+
+    # disable EMA / dropout / cond noise: this script never applies them.
+    configure_trainable(pixart, adapter, disable_adapter=args.disable_adapter)
+    params = [p for p in list(pixart.parameters()) + list(adapter.parameters()) if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
+
+    diffusion = GaussianDiffusion(timestep_respacing="")
+    pixart.train()
+    adapter.train()
+
+    print(f"[Overfit] sample={batch['path']} hr={tuple(hr.shape)} lr={tuple(lr.shape)} lr_small={tuple(lr_small.shape)} disable_adapter={args.disable_adapter}")
+    if roi is not None:
+        print(f"[Overfit] ROI={roi} (x1,y1,x2,y2)")
+
+    for step in range(1, args.train_steps + 1):
+        with torch.no_grad():
+            z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
+            z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
+
+        t = torch.randint(0, 1000, (z_hr.shape[0],), device=device).long()
+        noise = torch.randn_like(z_hr)
+        zt = diffusion.q_sample(z_hr, t, noise)
+
+        with torch.no_grad():
+            t_embed = pixart.t_embedder(t.to(dtype=compute_dtype))
+
+        cond = None
+        if not args.disable_adapter:
+            with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
+                cond = adapter(lr_small.to(dtype=compute_dtype), t_embed=t_embed)
+
+        with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
+            out = pixart(
+                x=zt.to(compute_dtype), timestep=t, y=y_embed,
+                aug_level=torch.zeros((zt.shape[0],), device=device, dtype=compute_dtype),
+                mask=None, data_info=data_info, adapter_cond=cond,
+                force_drop_ids=torch.ones(zt.shape[0], device=device),
+            )
+            model_pred = out.float()
+            alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, z_hr.shape)
+            sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, z_hr.shape)
+            target_v = alpha_t * noise - sigma_t * z_hr.float()
+            loss_v = F.mse_loss(model_pred, target_v)
+            z0 = alpha_t * zt.float() - sigma_t * model_pred
+            loss_latent_l1 = F.l1_loss(z0, z_hr.float())
+            loss = loss_v + 0.25 * loss_latent_l1
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step % 10 == 0 or step == 1:
+            print(f"[Step {step:04d}] loss={float(loss.item()):.6f} v={float(loss_v.item()):.6f} z_l1={float(loss_latent_l1.item()):.6f}")
+
+        if (step % args.save_every == 0) or (step == args.train_steps):
+            pixart.eval(); adapter.eval()
+            with torch.no_grad():
+                pred, metrics = run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_info, args, device, compute_dtype)
+            print(f"[Eval step {step}] full: PSNR={metrics['full']['psnr']:.4f}, SSIM={metrics['full']['ssim']:.4f}, LPIPS={metrics['full']['lpips']:.4f}")
+            if metrics["roi"] is not None:
+                print(f"[Eval step {step}] roi : PSNR={metrics['roi']['psnr']:.4f}, SSIM={metrics['roi']['ssim']:.4f}, LPIPS={metrics['roi']['lpips']:.4f}")
+            save_visuals(args.out_dir, step, hr, lr, pred, roi)
+            pixart.train(); adapter.train()
+
+
+if __name__ == "__main__":
+    main()
