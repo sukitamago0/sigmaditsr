@@ -34,6 +34,7 @@ class PixArtSigmaSR(PixArtMS):
         self.input_adaln = nn.ModuleList([nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True) for _ in range(self.depth)])
         self.input_res_proj = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(self.depth)])
         self.inject_gate = nn.Parameter(torch.full((self.depth,), -4.0))
+        self.cond_route_logits = nn.Parameter(torch.zeros(self.depth, 3))
 
         for lin in self.input_adaln:
             nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
@@ -63,9 +64,20 @@ class PixArtSigmaSR(PixArtMS):
             c_size, ar = data_info['img_hw'].to(self.dtype), data_info['aspect_ratio'].to(self.dtype)
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
-        cond_tokens = None
+        cond_tokens_early = None
+        cond_tokens_mid = None
+        cond_tokens_late = None
         if isinstance(adapter_cond, dict):
-            cond_tokens = adapter_cond.get("cond_tokens", None)
+            cond_tokens_early = adapter_cond.get("cond_tokens_early", None)
+            cond_tokens_mid = adapter_cond.get("cond_tokens_mid", None)
+            cond_tokens_late = adapter_cond.get("cond_tokens_late", None)
+            legacy = adapter_cond.get("cond_tokens", None)
+            if cond_tokens_early is None and legacy is not None:
+                cond_tokens_early = legacy
+            if cond_tokens_mid is None and legacy is not None:
+                cond_tokens_mid = legacy
+            if cond_tokens_late is None and legacy is not None:
+                cond_tokens_late = legacy
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -82,10 +94,16 @@ class PixArtSigmaSR(PixArtMS):
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
+        self._last_route_weights = torch.softmax(self.cond_route_logits.detach(), dim=1).cpu()
+
         for i, block in enumerate(self.blocks):
             adaln_shift, adaln_scale, adaln_alpha = None, None, None
-            if cond_tokens is not None:
-                feat = self.input_adapter_ln(cond_tokens.to(dtype=torch.float32))
+            if (cond_tokens_early is not None) and (cond_tokens_mid is not None) and (cond_tokens_late is not None):
+                route_w = torch.softmax(self.cond_route_logits[i], dim=0)
+                feat_early = self.input_adapter_ln(cond_tokens_early.to(dtype=torch.float32))
+                feat_mid = self.input_adapter_ln(cond_tokens_mid.to(dtype=torch.float32))
+                feat_late = self.input_adapter_ln(cond_tokens_late.to(dtype=torch.float32))
+                feat = route_w[0] * feat_early + route_w[1] * feat_mid + route_w[2] * feat_late
                 adaln_shift, adaln_scale = self.input_adaln[i](feat).chunk(2, dim=-1)
                 res = self.input_res_proj[i](feat).to(dtype=x.dtype)
                 gate = torch.sigmoid(self.inject_gate[i]).to(dtype=x.dtype)

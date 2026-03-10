@@ -226,7 +226,7 @@ def run(args):
         apply_lora(pixart, rank=ckpt_lora_rank, alpha=ckpt_lora_alpha)
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
-    adapter.load_state_dict(ckpt["adapter"], strict=True)
+    load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="infer-adapter")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()

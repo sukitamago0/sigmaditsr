@@ -282,7 +282,7 @@ def evaluate(args):
         _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="eval")
 
         adapter = build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(device).float()
-        adapter.load_state_dict(ckpt["adapter"], strict=True)
+        load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="eval-adapter")
 
         pixart.eval()
         adapter.eval()

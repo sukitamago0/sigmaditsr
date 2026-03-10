@@ -26,9 +26,12 @@ class SRConvNetLSAAdapter(nn.Module):
         self.proj2 = nn.Conv2d(128, 256, 1)
         self.proj3 = nn.Conv2d(256, 256, 1)
         self.proj4 = nn.Conv2d(256, 256, 1)
-        self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
 
-        for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
+        self.out_proj_early = nn.Conv2d(512, self.hidden_size, 1)
+        self.out_proj_mid = nn.Conv2d(512, self.hidden_size, 1)
+        self.out_proj_late = nn.Conv2d(768, self.hidden_size, 1)
+
+        for m in [self.proj2, self.proj3, self.proj4, self.out_proj_early, self.out_proj_mid, self.out_proj_late]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
 
@@ -55,12 +58,25 @@ class SRConvNetLSAAdapter(nn.Module):
         c2 = self.proj2(f2_32)
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
-        cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
-        cond_tokens = cond_map.flatten(2).transpose(1, 2)
+        early_map = self.out_proj_early(torch.cat([c4, c3], dim=1))
+        mid_map = self.out_proj_mid(torch.cat([c3, c4], dim=1))
+        late_map = self.out_proj_late(torch.cat([c2, c3, c4], dim=1))
+
+        cond_tokens_early = early_map.flatten(2).transpose(1, 2)
+        cond_tokens_mid = mid_map.flatten(2).transpose(1, 2)
+        cond_tokens_late = late_map.flatten(2).transpose(1, 2)
 
         return {
-            "cond_tokens": cond_tokens,
-            "cond_maps": [f2, f3, f4],
+            "cond_tokens_early": cond_tokens_early,
+            "cond_tokens_mid": cond_tokens_mid,
+            "cond_tokens_late": cond_tokens_late,
+            # backward compatibility alias; new path should use *_early/mid/late
+            "cond_tokens": cond_tokens_late,
+            "cond_maps": {
+                "f2": f2,
+                "f3": f3,
+                "f4": f4,
+            },
         }
 
 

@@ -1141,7 +1141,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = ["final_layer", "input_adaln", "input_res_proj", "inject_gate"]
+    always_train_keywords = ["final_layer", "input_adaln", "input_res_proj", "inject_gate", "cond_route_logits"]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
 
@@ -1487,8 +1487,8 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
     adapter_sd = ckpt.get("adapter", None)
     if isinstance(adapter_sd, dict):
         try:
-            adapter.load_state_dict(adapter_sd, strict=True)
-            print("✅ Adapter bootstrap load succeeded.")
+            miss, unexp, sk = load_state_dict_shape_compatible(adapter, adapter_sd, context="init-adapter")
+            print(f"✅ Adapter bootstrap load: missing={len(miss)}, unexpected={len(unexp)}, skipped={len(sk)}")
         except Exception as e:
             print(f"⚠️ Adapter bootstrap load skipped due to mismatch: {e}")
     return True
@@ -2006,6 +2006,13 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
+                rw = getattr(pixart, "_last_route_weights", None)
+                if torch.is_tensor(rw):
+                    rE = float(rw[:, 0].mean().item())
+                    rM = float(rw[:, 1].mean().item())
+                    rL = float(rw[:, 2].mean().item())
+                else:
+                    rE = rM = rL = 0.0
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2021,6 +2028,9 @@ def main():
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
+                    'rE': f"{rE:.3f}",
+                    'rM': f"{rM:.3f}",
+                    'rL': f"{rL:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
