@@ -70,7 +70,13 @@ def run(args):
     else:
         pixart.load_state_dict(base, strict=False)
 
-    adapter = build_adapter_msm_qca(hidden_size=1152).to(device).float()
+    adapter = build_adapter_msm_qca(
+        hidden_size=1152,
+        memory_token_counts=DEFAULT_MEMORY_TOKEN_COUNTS,
+        resampler_dim=DEFAULT_RESAMPLER_DIM,
+        resampler_depth=DEFAULT_RESAMPLER_DEPTH,
+        resampler_heads=DEFAULT_RESAMPLER_HEADS,
+    ).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())

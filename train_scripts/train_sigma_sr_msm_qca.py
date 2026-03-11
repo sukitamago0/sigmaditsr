@@ -266,7 +266,13 @@ def main():
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
-    adapter = build_adapter_msm_qca(hidden_size=1152).to(DEVICE).train()
+    adapter = build_adapter_msm_qca(
+        hidden_size=1152,
+        memory_token_counts=MEMORY_TOKEN_COUNTS,
+        resampler_dim=RESAMPLER_DIM,
+        resampler_depth=RESAMPLER_DEPTH,
+        resampler_heads=RESAMPLER_HEADS,
+    ).to(DEVICE).train()
     apply_lora_attn_only(pixart, rank=LORA_RANK, alpha=LORA_ALPHA)
 
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
@@ -279,7 +285,16 @@ def main():
     diffusion = IDDPM(str(1000))
 
     configure_trainable_msm_qca(pixart, adapter, disable_adapter=False, bridge_only_debug=False)
-    optimizer = build_optimizer_msm_qca(pixart, adapter, disable_adapter=False, pixart_lr=1e-5, adapter_lr=3e-5, weight_decay=0.01)
+    optimizer = build_optimizer_msm_qca(
+        pixart,
+        adapter,
+        disable_adapter=False,
+        memory_bridge_lr=1e-4,
+        adapter_backbone_lr=3e-5,
+        pixart_readout_bridge_lr=5e-5,
+        pixart_low_lr=5e-6,
+        weight_decay=0.01,
+    )
 
     msm_qca_config = build_msm_qca_config(
         adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
@@ -293,7 +308,12 @@ def main():
         dataset_name=DATASET_NAME,
         crop_size=CROP_SIZE,
         scale=SCALE,
-        optimizer_lrs=optimizer_group_lrs(pixart_lr=1e-5, adapter_lr=3e-5),
+        optimizer_lrs=optimizer_group_lrs(
+            memory_bridge_lr=1e-4,
+            adapter_backbone_lr=3e-5,
+            pixart_readout_bridge_lr=5e-5,
+            pixart_low_lr=5e-6,
+        ),
     )
 
     print(f"[MSM-QCA Mainline] out_dir={OUT_DIR}")

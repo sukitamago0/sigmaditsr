@@ -305,7 +305,13 @@ def evaluate(args):
 
         _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="eval")
 
-        adapter = build_adapter_msm_qca(hidden_size=1152).to(device).float()
+        adapter = build_adapter_msm_qca(
+            hidden_size=1152,
+            memory_token_counts=DEFAULT_MEMORY_TOKEN_COUNTS,
+            resampler_dim=DEFAULT_RESAMPLER_DIM,
+            resampler_depth=DEFAULT_RESAMPLER_DEPTH,
+            resampler_heads=DEFAULT_RESAMPLER_HEADS,
+        ).to(device).float()
         miss, unexp = adapter.load_state_dict(ckpt["adapter"], strict=True)
         print(f"[eval-adapter] strict load ok: missing={len(miss)}, unexpected={len(unexp)}")
 

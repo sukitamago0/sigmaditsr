@@ -46,9 +46,23 @@ class MultiScaleMemoryResampler(nn.Module):
 
 
 class SRConvNetMSMQCAAdapter(nn.Module):
-    def __init__(self, hidden_size: int = 1152):
+    def __init__(
+        self,
+        hidden_size: int = 1152,
+        memory_token_counts=(64, 32, 16),
+        resampler_dim: int = 512,
+        resampler_heads: int = 8,
+        resampler_depth: int = 2,
+    ):
         super().__init__()
         self.hidden_size = int(hidden_size)
+        self.memory_token_counts = tuple(int(x) for x in memory_token_counts)
+        if len(self.memory_token_counts) != 3:
+            raise ValueError(f"memory_token_counts must be length-3, got {self.memory_token_counts}")
+        self.resampler_dim = int(resampler_dim)
+        self.resampler_heads = int(resampler_heads)
+        self.resampler_depth = int(resampler_depth)
+        n2, n3, n4 = self.memory_token_counts
 
         # keep existing SRConvNet-style backbone and time FiLM
         self.stem = nn.Conv2d(3, 64, 3, padding=1)
@@ -65,20 +79,20 @@ class SRConvNetMSMQCAAdapter(nn.Module):
         )
 
         # multi-scale feature projections to memory token dim
-        self.mem_proj_f2 = nn.Conv2d(128, 512, 1)
-        self.mem_proj_f3 = nn.Conv2d(256, 512, 1)
-        self.mem_proj_f4 = nn.Conv2d(256, 512, 1)
+        self.mem_proj_f2 = nn.Conv2d(128, self.resampler_dim, 1)
+        self.mem_proj_f3 = nn.Conv2d(256, self.resampler_dim, 1)
+        self.mem_proj_f4 = nn.Conv2d(256, self.resampler_dim, 1)
 
         # standard sin-cos style positional encoding + scale embedding
-        self.scale_embed = nn.Parameter(torch.zeros(3, 512))
+        self.scale_embed = nn.Parameter(torch.zeros(3, self.resampler_dim))
 
         # learnable latent queries
-        self.q2 = nn.Parameter(torch.randn(64, 512) * 0.02)
-        self.q3 = nn.Parameter(torch.randn(32, 512) * 0.02)
-        self.q4 = nn.Parameter(torch.randn(16, 512) * 0.02)
+        self.q2 = nn.Parameter(torch.randn(n2, self.resampler_dim) * 0.02)
+        self.q3 = nn.Parameter(torch.randn(n3, self.resampler_dim) * 0.02)
+        self.q4 = nn.Parameter(torch.randn(n4, self.resampler_dim) * 0.02)
 
-        self.resampler = MultiScaleMemoryResampler(dim=512, heads=8, depth=2)
-        self.memory_out_proj = nn.Linear(512, self.hidden_size)
+        self.resampler = MultiScaleMemoryResampler(dim=self.resampler_dim, heads=self.resampler_heads, depth=self.resampler_depth)
+        self.memory_out_proj = nn.Linear(self.resampler_dim, self.hidden_size)
         self.memory_ln = nn.LayerNorm(self.hidden_size)
 
         for m in [self.mem_proj_f2, self.mem_proj_f3, self.mem_proj_f4]:
@@ -98,7 +112,7 @@ class SRConvNetMSMQCAAdapter(nn.Module):
         b, _, h, w = feat.shape
         key = (int(h), int(w))
         if key not in self._pos_cache_names:
-            pos = get_2d_sincos_pos_embed(512, (h, w))  # [h*w, 512]
+            pos = get_2d_sincos_pos_embed(self.resampler_dim, (h, w))  # [h*w, dim]
             pos_name = f"_pos_tokens_{h}x{w}"
             self.register_buffer(pos_name, torch.from_numpy(pos).float(), persistent=False)
             self._pos_cache_names[key] = pos_name
@@ -157,10 +171,21 @@ class SRConvNetMSMQCAAdapter(nn.Module):
 
         return {
             "memory_tokens": memory,
-            "memory_meta": {"n2": 64, "n3": 32, "n4": 16},
+            "memory_meta": {"n2": self.memory_token_counts[0], "n3": self.memory_token_counts[1], "n4": self.memory_token_counts[2]},
         }
 
 
-def build_adapter_msm_qca(hidden_size=1152):
-    return SRConvNetMSMQCAAdapter(hidden_size=hidden_size)
-
+def build_adapter_msm_qca(
+    hidden_size=1152,
+    memory_token_counts=(64, 32, 16),
+    resampler_dim=512,
+    resampler_depth=2,
+    resampler_heads=8,
+):
+    return SRConvNetMSMQCAAdapter(
+        hidden_size=hidden_size,
+        memory_token_counts=memory_token_counts,
+        resampler_dim=resampler_dim,
+        resampler_depth=resampler_depth,
+        resampler_heads=resampler_heads,
+    )

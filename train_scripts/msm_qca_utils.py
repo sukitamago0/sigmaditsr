@@ -287,7 +287,17 @@ def configure_trainable_msm_qca(pixart: nn.Module, adapter: nn.Module, disable_a
             p.requires_grad_(any(k in n for k in bridge_keys))
 
 
-def build_optimizer_msm_qca(pixart: nn.Module, adapter: nn.Module, *, disable_adapter: bool = False, pixart_lr: float = 1e-5, adapter_lr: float = 3e-5, weight_decay: float = 0.01):
+def build_optimizer_msm_qca(
+    pixart: nn.Module,
+    adapter: nn.Module,
+    *,
+    disable_adapter: bool = False,
+    memory_bridge_lr: float = 1e-4,
+    adapter_backbone_lr: float = 3e-5,
+    pixart_readout_bridge_lr: float = 5e-5,
+    pixart_low_lr: float = 5e-6,
+    weight_decay: float = 0.01,
+):
     pixart_readout_bridge, pixart_low_lr = [], []
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
@@ -299,9 +309,9 @@ def build_optimizer_msm_qca(pixart: nn.Module, adapter: nn.Module, *, disable_ad
 
     groups = []
     if pixart_readout_bridge:
-        groups.append({"params": pixart_readout_bridge, "lr": max(5e-5, float(pixart_lr)), "weight_decay": weight_decay, "name": "pixart_readout_bridge"})
+        groups.append({"params": pixart_readout_bridge, "lr": float(pixart_readout_bridge_lr), "weight_decay": weight_decay, "name": "pixart_readout_bridge"})
     if pixart_low_lr:
-        groups.append({"params": pixart_low_lr, "lr": min(5e-6, float(pixart_lr)), "weight_decay": weight_decay, "name": "pixart_low_lr"})
+        groups.append({"params": pixart_low_lr, "lr": float(pixart_low_lr), "weight_decay": weight_decay, "name": "pixart_low_lr"})
 
     if not disable_adapter:
         memory_bridge, adapter_backbone = [], []
@@ -313,9 +323,9 @@ def build_optimizer_msm_qca(pixart: nn.Module, adapter: nn.Module, *, disable_ad
             else:
                 adapter_backbone.append(p)
         if memory_bridge:
-            groups.append({"params": memory_bridge, "lr": max(1e-4, float(adapter_lr)), "weight_decay": weight_decay, "name": "memory_bridge"})
+            groups.append({"params": memory_bridge, "lr": float(memory_bridge_lr), "weight_decay": weight_decay, "name": "memory_bridge"})
         if adapter_backbone:
-            groups.append({"params": adapter_backbone, "lr": float(adapter_lr), "weight_decay": weight_decay, "name": "adapter_backbone"})
+            groups.append({"params": adapter_backbone, "lr": float(adapter_backbone_lr), "weight_decay": weight_decay, "name": "adapter_backbone"})
 
     for g in groups:
         print(f"[OptimGroup] {g['name']}: lr={g['lr']} params={sum(p.numel() for p in g['params'])}")
@@ -323,12 +333,18 @@ def build_optimizer_msm_qca(pixart: nn.Module, adapter: nn.Module, *, disable_ad
     return torch.optim.AdamW(groups, weight_decay=weight_decay)
 
 
-def optimizer_group_lrs(pixart_lr: float = 1e-5, adapter_lr: float = 3e-5):
+def optimizer_group_lrs(
+    *,
+    memory_bridge_lr: float = 1e-4,
+    adapter_backbone_lr: float = 3e-5,
+    pixart_readout_bridge_lr: float = 5e-5,
+    pixart_low_lr: float = 5e-6,
+):
     return {
-        "memory_bridge": max(1e-4, float(adapter_lr)),
-        "adapter_backbone": float(adapter_lr),
-        "pixart_readout_bridge": max(5e-5, float(pixart_lr)),
-        "pixart_low_lr": min(5e-6, float(pixart_lr)),
+        "memory_bridge": float(memory_bridge_lr),
+        "adapter_backbone": float(adapter_backbone_lr),
+        "pixart_readout_bridge": float(pixart_readout_bridge_lr),
+        "pixart_low_lr": float(pixart_low_lr),
     }
 
 

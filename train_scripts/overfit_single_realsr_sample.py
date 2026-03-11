@@ -564,7 +564,13 @@ def main():
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
-    adapter = build_adapter_msm_qca(hidden_size=1152).to(device).float()
+    adapter = build_adapter_msm_qca(
+        hidden_size=1152,
+        memory_token_counts=DEFAULT_MEMORY_TOKEN_COUNTS,
+        resampler_dim=DEFAULT_RESAMPLER_DIM,
+        resampler_depth=DEFAULT_RESAMPLER_DEPTH,
+        resampler_heads=DEFAULT_RESAMPLER_HEADS,
+    ).to(device).float()
 
     print(f"[Overfit] init_mode={args.init_mode}")
     if args.init_mode == "warm":
@@ -623,8 +629,10 @@ def main():
         pixart,
         adapter,
         disable_adapter=args.disable_adapter,
-        pixart_lr=args.pixart_lr,
-        adapter_lr=args.adapter_lr,
+        memory_bridge_lr=max(1e-4, float(args.adapter_lr)),
+        adapter_backbone_lr=float(args.adapter_lr),
+        pixart_readout_bridge_lr=max(5e-5, float(args.pixart_lr)),
+        pixart_low_lr=min(5e-6, float(args.pixart_lr)),
         weight_decay=0.0,
     )
 
