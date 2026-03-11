@@ -1,3 +1,14 @@
+
+## MSM-QCA Current Mainline Entrypoints
+
+To avoid accidental legacy usage, use these scripts as the current MSM-QCA mainline:
+
+- **Main training**: `train_scripts/train_sigma_sr_vpred_dualstream.py`
+- **Main inference**: `train_scripts/infer_sr_single_ddim100_msm_qca.py`
+- **Main evaluation**: `train_scripts/eval_sr_baseline_vs_model.py`
+
+Legacy dualstream scripts are retained for reference and are marked as `LEGACY / NOT FOR CURRENT MSM-QCA MAINLINE`.
+
 <p align="center">
   <img src="asset/logo-sigma.png"  height=120>
 </p>

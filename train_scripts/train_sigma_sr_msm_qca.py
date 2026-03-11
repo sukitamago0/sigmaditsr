@@ -1,30 +1,24 @@
-"""MSM-QCA MAINLINE TRAINING SCRIPT (in-place replacement of legacy dualstream trainer).
+"""MSM-QCA current mainline.
 
-Current mainline behavior:
-- single-stage MSM-QCA training
-- no dualstream/injection/style-fusion/kv-compress training branches
-- explicit adapter CA blocks and strict MSM-QCA checkpoint metadata
+Main entries:
+- train: train_scripts/train_sigma_sr_msm_qca.py
+- infer: train_scripts/infer_sr_single_ddim100_msm_qca.py
+- eval : train_scripts/eval_sr_baseline_vs_model.py
 """
 import os
 import sys
-import math
-import random
 from pathlib import Path
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from diffusers import AutoencoderKL, DDIMScheduler
-from torchmetrics.functional import peak_signal_noise_ratio as psnr
-from torchmetrics.functional import structural_similarity_index_measure as ssim
-import lpips
 
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -32,6 +26,7 @@ from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_msm_qca
 from diffusion.model.utils import set_grad_checkpoint
 from train_scripts.msm_qca_utils import (
+    DEFAULT_ADAPTER_CA_BLOCK_IDS,
     DEFAULT_MEMORY_TOKEN_COUNTS,
     DEFAULT_RESAMPLER_DIM,
     DEFAULT_RESAMPLER_DEPTH,
@@ -56,14 +51,12 @@ from train_scripts.msm_qca_utils import (
     assert_msm_qca_config_compatible,
 )
 
-# ===== MSM-QCA structure config =====
-ADAPTER_CA_BLOCK_IDS = [14, 18, 22, 26]
+ADAPTER_CA_BLOCK_IDS = [int(x.strip()) for x in os.getenv("ADAPTER_CA_BLOCK_IDS", ",".join(map(str, DEFAULT_ADAPTER_CA_BLOCK_IDS))).split(",") if x.strip()]
 MEMORY_TOKEN_COUNTS = [int(x.strip()) for x in os.getenv("MEMORY_TOKEN_COUNTS", ",".join(map(str, DEFAULT_MEMORY_TOKEN_COUNTS))).split(",") if x.strip()]
 RESAMPLER_DIM = int(os.getenv("RESAMPLER_DIM", str(DEFAULT_RESAMPLER_DIM)))
 RESAMPLER_DEPTH = int(os.getenv("RESAMPLER_DEPTH", str(DEFAULT_RESAMPLER_DEPTH)))
 RESAMPLER_HEADS = int(os.getenv("RESAMPLER_HEADS", str(DEFAULT_RESAMPLER_HEADS)))
 
-# ===== training config =====
 SEED = int(os.getenv("SEED", "3407"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
@@ -73,8 +66,8 @@ MAX_TRAIN_STEPS = int(os.getenv("MAX_TRAIN_STEPS", "20000"))
 GRAD_ACCUM_STEPS = int(os.getenv("GRAD_ACCUM_STEPS", "16"))
 SAVE_EVERY = int(os.getenv("SAVE_EVERY", "1000"))
 VAL_EVERY = int(os.getenv("VAL_EVERY", "1000"))
-VAL_STEPS_LIST = [50]
-BEST_VAL_STEPS = 50
+VAL_STEPS = int(os.getenv("VAL_STEPS", "50"))
+MAX_VAL_SAMPLES = int(os.getenv("MAX_VAL_SAMPLES", "16"))
 
 T_SAMPLE_MODE = os.getenv("T_SAMPLE_MODE", "power")
 T_SAMPLE_POWER = float(os.getenv("T_SAMPLE_POWER", "2.5"))
@@ -91,9 +84,7 @@ SCALE = int(os.getenv("SCALE", str(DEFAULT_DATA_CONFIG["scale"])))
 TRAIN_DF2K_HR_DIR = os.getenv("TRAIN_DF2K_HR_DIR", DEFAULT_DATA_CONFIG["train_df2k_hr_dir"])
 TRAIN_DF2K_LR_DIR = os.getenv("TRAIN_DF2K_LR_DIR", DEFAULT_DATA_CONFIG["train_df2k_lr_dir"])
 TRAIN_REALSR_ROOTS = [x.strip() for x in os.getenv("TRAIN_REALSR_ROOTS", ",".join(DEFAULT_DATA_CONFIG["train_realsr_roots"])).split(",") if x.strip()]
-VAL_REALSR_ROOTS = [
-    x.strip() for x in os.getenv("VAL_REALSR_ROOTS", "/data/RealSR/Nikon/Test/4,/data/RealSR/Canon/Test/4").split(",") if x.strip()
-]
+VAL_REALSR_ROOTS = [x.strip() for x in os.getenv("VAL_REALSR_ROOTS", ",".join(DEFAULT_DATA_CONFIG["val_realsr_roots"])).split(",") if x.strip()]
 
 PRETRAINED_ROOT = os.getenv("DTSR_PRETRAINED_ROOT", "/home/hello/HJT/PixArt-sigma/output/pretrained_models")
 PIXART_PATH = os.path.join(PRETRAINED_ROOT, "PixArt-Sigma-XL-2-512-MS.pth")
@@ -102,7 +93,7 @@ VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
 NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth")
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_msm_qca")
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR = os.path.join(OUT_DIR, "vis")
 LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last.pth")
@@ -112,15 +103,6 @@ os.makedirs(VIS_DIR, exist_ok=True)
 
 LORA_RANK = int(os.getenv("LORA_RANK", "4"))
 LORA_ALPHA = int(os.getenv("LORA_ALPHA", "4"))
-MEMORY_BRIDGE_LR = float(os.getenv("MEMORY_BRIDGE_LR", "1e-4"))
-ADAPTER_BACKBONE_LR = float(os.getenv("ADAPTER_BACKBONE_LR", "3e-5"))
-PIXART_READOUT_BRIDGE_LR = float(os.getenv("PIXART_READOUT_BRIDGE_LR", "5e-5"))
-PIXART_LOW_LR = float(os.getenv("PIXART_LOW_LR", "5e-6"))
-
-
-def rgb01_to_y01(rgb01: torch.Tensor):
-    r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
-    return (16.0 + 65.481 * r + 128.553 * g + 24.966 * b) / 255.0
 
 
 def randn_like_with_generator(tensor, generator):
@@ -140,150 +122,103 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 
 
 def save_preview_image(step: int, pred: torch.Tensor):
-    out = os.path.join(VIS_DIR, f"preview_step_{step:07d}.png")
     img = ((pred[0].detach().cpu().permute(1, 2, 0).float().numpy() + 1.0) * 127.5).clip(0, 255).astype("uint8")
+    out = os.path.join(VIS_DIR, f"preview_step_{step:07d}.png")
     Image.fromarray(img).save(out)
     print(f"[preview] saved {out}")
 
 
-def should_keep_ckpt(psnr_v: float, lpips_v: float, best):
-    # PSNR first, LPIPS tiebreak (legacy rule)
-    if best is None:
-        return True
-    b_psnr = float(best["psnr"])
-    b_lpips = float(best["lpips"])
-    if float(psnr_v) > b_psnr + 1e-9:
-        return True
-    if abs(float(psnr_v) - b_psnr) <= 1e-9 and float(lpips_v) < b_lpips:
-        return True
-    return False
-
-
 @torch.no_grad()
-def validate(step, pixart, adapter, vae, val_loader, y_embed, lpips_fn_cpu):
-    pixart.eval()
-    adapter.eval()
-
+def run_validation(step, pixart, adapter, vae, y_embed, val_loader):
+    if val_loader is None:
+        return None
+    scheduler = DDIMScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.0001,
+        beta_end=0.02,
+        beta_schedule="linear",
+        clip_sample=False,
+        prediction_type="v_prediction",
+        set_alpha_to_one=False,
+    )
+    scheduler.set_timesteps(VAL_STEPS, device=DEVICE)
+    gen = torch.Generator(device=DEVICE)
+    gen.manual_seed(SEED + step)
     data_info = {
         "img_hw": torch.tensor([[float(CROP_SIZE), float(CROP_SIZE)]], device=DEVICE),
         "aspect_ratio": torch.tensor([1.0], device=DEVICE),
     }
 
-    all_res = {}
-    for steps in VAL_STEPS_LIST:
-        scheduler = DDIMScheduler(
-            num_train_timesteps=1000,
-            beta_start=0.0001,
-            beta_end=0.02,
-            beta_schedule="linear",
-            clip_sample=False,
-            prediction_type="v_prediction",
-            set_alpha_to_one=False,
-        )
-        scheduler.set_timesteps(int(steps), device=DEVICE)
-        gen = torch.Generator(device=DEVICE)
-        gen.manual_seed(SEED + int(step) + int(steps))
+    pixart.eval()
+    adapter.eval()
+    losses = []
+    preview_pred = None
+    for i, batch in enumerate(val_loader):
+        if i >= MAX_VAL_SAMPLES:
+            break
+        hr = batch["hr"].to(DEVICE)
+        lr = batch["lr"].to(DEVICE)
+        lr_small = batch["lr_small"].to(DEVICE)
 
-        psnrs, ssims, lpipss = [], [], []
-        preview_pred = None
-        for batch in tqdm(val_loader, desc=f"Val@{steps}", leave=False):
-            hr = batch["hr"].to(DEVICE)
-            lr = batch["lr"].to(DEVICE)
-            lr_small = batch["lr_small"].to(DEVICE)
+        z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
+        z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
+        latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, VAL_STEPS, gen, 0.3, COMPUTE_DTYPE)
+        for t in run_timesteps:
+            t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
+            t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
+            cond = adapter(lr_small.to(dtype=COMPUTE_DTYPE), t_embed=t_embed)
+            out = pixart(
+                x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
+                aug_level=torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE),
+                mask=None, data_info=data_info, adapter_cond=cond,
+                force_drop_ids=torch.ones(latents.shape[0], device=DEVICE),
+            )
+            latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-            z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
-            latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, int(steps), gen, 0.3, COMPUTE_DTYPE)
-
-            aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
-            for t in run_timesteps:
-                t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
-                t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
-                cond = adapter(lr_small.to(dtype=COMPUTE_DTYPE), t_embed=t_embed)
-                out = pixart(
-                    x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
-                    aug_level=aug_level, mask=None, data_info=data_info,
-                    adapter_cond=cond, force_drop_ids=torch.ones(latents.shape[0], device=DEVICE)
-                )
-                latents = scheduler.step(out.float(), t, latents.float()).prev_sample
-
-            pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
-            if preview_pred is None:
-                preview_pred = pred
-
-            pred01 = (pred + 1.0) / 2.0
-            hr01 = (hr + 1.0) / 2.0
-            py = rgb01_to_y01(pred01)[..., 4:-4, 4:-4]
-            hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
-
-            psnrs.append(float(psnr(py, hy, data_range=1.0).item()))
-            ssims.append(float(ssim(py, hy, data_range=1.0).item()))
-            lpipss.append(float(lpips_fn_cpu(pred.detach().cpu().float(), hr.detach().cpu().float()).mean().item()))
-
-        if preview_pred is not None and int(steps) == int(BEST_VAL_STEPS):
-            save_preview_image(step, preview_pred)
-
-        all_res[int(steps)] = {
-            "psnr": float(np.mean(psnrs)) if psnrs else 0.0,
-            "ssim": float(np.mean(ssims)) if ssims else 0.0,
-            "lpips": float(np.mean(lpipss)) if lpipss else 1e9,
-        }
-        print(f"[VAL@{steps}] step={step} PSNR={all_res[int(steps)]['psnr']:.4f} SSIM={all_res[int(steps)]['ssim']:.6f} LPIPS={all_res[int(steps)]['lpips']:.6f}")
+        pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
+        losses.append(float(F.l1_loss(pred.float(), hr.float()).item()))
+        if preview_pred is None:
+            preview_pred = pred
 
     pixart.train()
     adapter.train()
-    return all_res
+    if preview_pred is not None:
+        save_preview_image(step, preview_pred)
+    val_l1 = float(sum(losses) / max(1, len(losses)))
+    print(f"[val step={step}] mean_l1={val_l1:.6f} samples={len(losses)}")
+    return val_l1
 
 
-def save_ckpt(path, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen):
-    cuda_rng_state_all = None
-    if torch.cuda.is_available():
-        cuda_rng_state_all = [x.cpu() for x in torch.cuda.get_rng_state_all()]
-    sd = {
-        "step": int(step),
-        "epoch": int(epoch),
-        "pixart_keep": {k: v.detach().cpu().float() for k, v in pixart.state_dict().items()},
-        "adapter": {k: v.detach().cpu().float() for k, v in adapter.state_dict().items()},
-        "optimizer": optimizer.state_dict(),
-        "best_eval_metrics": dict(best_metrics) if best_metrics is not None else None,
-        "lora_rank": int(LORA_RANK),
-        "lora_alpha": int(LORA_ALPHA),
-        "msm_qca_config": msm_qca_config,
-        "torch_rng_state": torch.get_rng_state().cpu(),
-        "cuda_rng_state_all": cuda_rng_state_all,
-        "numpy_rng_state": np.random.get_state(),
-        "python_rng_state": random.getstate(),
-        "dl_gen_state": dl_gen.get_state() if dl_gen is not None else None,
-    }
-    torch.save(sd, path)
+def save_ckpt(path, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config):
+    torch.save(
+        {
+            "step": int(step),
+            "pixart_keep": {k: v.detach().cpu().float() for k, v in pixart.state_dict().items()},
+            "adapter": {k: v.detach().cpu().float() for k, v in adapter.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "best_val_l1": float(best_val_l1),
+            "lora_rank": int(LORA_RANK),
+            "lora_alpha": int(LORA_ALPHA),
+            "msm_qca_config": msm_qca_config,
+        },
+        path,
+    )
 
 
-def resume_if_possible(pixart, adapter, optimizer, msm_qca_config, dl_gen):
+def maybe_resume(pixart, adapter, optimizer, msm_qca_config):
     if not os.path.isfile(LAST_CKPT_PATH):
         print("[resume] no last checkpoint, train from scratch")
-        return 0, 0, None
+        return 0, float("inf")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
     assert_msm_qca_config_compatible(msm_qca_config, ckpt.get("msm_qca_config", {}), context="train-resume")
     load_pixart_subset_compatible(pixart, ckpt.get("pixart_keep", {}), context="train-resume")
     miss, unexp = adapter.load_state_dict(ckpt["adapter"], strict=True)
     print(f"[train-resume] adapter strict load ok: missing={len(miss)} unexpected={len(unexp)}")
     optimizer.load_state_dict(ckpt["optimizer"])
-
-    if "torch_rng_state" in ckpt and ckpt["torch_rng_state"] is not None:
-        torch.set_rng_state(ckpt["torch_rng_state"])
-    if torch.cuda.is_available() and ("cuda_rng_state_all" in ckpt) and (ckpt["cuda_rng_state_all"] is not None):
-        torch.cuda.set_rng_state_all(ckpt["cuda_rng_state_all"])
-    if "numpy_rng_state" in ckpt and ckpt["numpy_rng_state"] is not None:
-        np.random.set_state(ckpt["numpy_rng_state"])
-    if "python_rng_state" in ckpt and ckpt["python_rng_state"] is not None:
-        random.setstate(ckpt["python_rng_state"])
-    if (dl_gen is not None) and ("dl_gen_state" in ckpt) and (ckpt["dl_gen_state"] is not None):
-        dl_gen.set_state(ckpt["dl_gen_state"])
-
     step = int(ckpt.get("step", 0))
-    epoch = int(ckpt.get("epoch", 0))
-    best_metrics = ckpt.get("best_eval_metrics", None)
-    print(f"[resume] restored from {LAST_CKPT_PATH} @ step={step} epoch={epoch}")
-    return step, epoch, best_metrics
+    best_val_l1 = float(ckpt.get("best_val_l1", float("inf")))
+    print(f"[resume] restored from {LAST_CKPT_PATH} @ step={step} best_val_l1={best_val_l1:.6f}")
+    return step, best_val_l1
 
 
 def main():
@@ -298,7 +233,8 @@ def main():
         realsr_roots=TRAIN_REALSR_ROOTS,
         seed=SEED,
     )
-    dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
+    dl_gen = torch.Generator()
+    dl_gen.manual_seed(SEED)
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
@@ -309,15 +245,15 @@ def main():
         generator=dl_gen,
     )
 
-    val_ds = RealSRPairedDataset(roots=VAL_REALSR_ROOTS, crop_size=CROP_SIZE, scale=SCALE)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=min(4, NUM_WORKERS))
+    val_loader = None
+    try:
+        val_ds = RealSRPairedDataset(roots=VAL_REALSR_ROOTS, crop_size=CROP_SIZE, scale=SCALE)
+        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=min(NUM_WORKERS, 4))
+        print(f"[val] enabled RealSR validation with {len(val_ds)} samples")
+    except Exception as e:
+        print(f"[val] disabled: {e}")
 
-    pixart = PixArtSigmaSR_XL_2(
-        input_size=64,
-        in_channels=4,
-        out_channels=4,
-        adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
-    ).to(DEVICE)
+    pixart = PixArtSigmaSR_XL_2(input_size=64, in_channels=4, out_channels=4, adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
 
     base = torch.load(PIXART_PATH, map_location="cpu")
@@ -344,10 +280,7 @@ def main():
 
     null_pack = torch.load(NULL_T5_EMBED_PATH, map_location="cpu")
     y = null_pack["y"].to(DEVICE)
-    data_info = {
-        "img_hw": torch.tensor([[float(CROP_SIZE), float(CROP_SIZE)]], device=DEVICE),
-        "aspect_ratio": torch.tensor([1.0], device=DEVICE),
-    }
+    d_info = {"img_hw": torch.tensor([[float(CROP_SIZE), float(CROP_SIZE)]], device=DEVICE), "aspect_ratio": torch.tensor([1.0], device=DEVICE)}
 
     diffusion = IDDPM(str(1000))
 
@@ -356,16 +289,12 @@ def main():
         pixart,
         adapter,
         disable_adapter=False,
-        memory_bridge_lr=MEMORY_BRIDGE_LR,
-        adapter_backbone_lr=ADAPTER_BACKBONE_LR,
-        pixart_readout_bridge_lr=PIXART_READOUT_BRIDGE_LR,
-        pixart_low_lr=PIXART_LOW_LR,
+        memory_bridge_lr=1e-4,
+        adapter_backbone_lr=3e-5,
+        pixart_readout_bridge_lr=5e-5,
+        pixart_low_lr=5e-6,
         weight_decay=0.01,
     )
-
-    lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
-    for p in lpips_fn_val_cpu.parameters():
-        p.requires_grad_(False)
 
     msm_qca_config = build_msm_qca_config(
         adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
@@ -380,26 +309,26 @@ def main():
         crop_size=CROP_SIZE,
         scale=SCALE,
         optimizer_lrs=optimizer_group_lrs(
-            memory_bridge_lr=MEMORY_BRIDGE_LR,
-            adapter_backbone_lr=ADAPTER_BACKBONE_LR,
-            pixart_readout_bridge_lr=PIXART_READOUT_BRIDGE_LR,
-            pixart_low_lr=PIXART_LOW_LR,
+            memory_bridge_lr=1e-4,
+            adapter_backbone_lr=3e-5,
+            pixart_readout_bridge_lr=5e-5,
+            pixart_low_lr=5e-6,
         ),
     )
 
-    print(f"[MSM-QCA mainline] out_dir={OUT_DIR}")
-    print(f"[MSM-QCA mainline] adapter_ca_block_ids={ADAPTER_CA_BLOCK_IDS}")
+    print(f"[MSM-QCA Mainline] out_dir={OUT_DIR}")
+    print(f"[MSM-QCA Mainline] adapter_ca_block_ids={ADAPTER_CA_BLOCK_IDS}")
 
-    step, epoch, best_metrics = resume_if_possible(pixart, adapter, optimizer, msm_qca_config, dl_gen)
+    step, best_val_l1 = maybe_resume(pixart, adapter, optimizer, msm_qca_config)
 
-    accum_micro_steps = 0
+    accum = 0
     optimizer.zero_grad()
     pbar = tqdm(total=MAX_TRAIN_STEPS, desc="train_msm_qca", initial=step)
+    epoch = 0
     params_to_clip = [p for p in list(pixart.parameters()) + list(adapter.parameters()) if p.requires_grad]
-
     while step < MAX_TRAIN_STEPS:
         train_ds.set_epoch(epoch)
-        for _, batch in enumerate(train_loader):
+        for i, batch in enumerate(train_loader):
             hr = batch["hr"].to(DEVICE)
             lr = batch["lr"].to(DEVICE)
             lr_small = batch["lr_small"].to(DEVICE, dtype=COMPUTE_DTYPE)
@@ -423,12 +352,13 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE, enabled=(DEVICE == "cuda")):
                 cond = adapter(lr_small, t_embed=t_embed)
-                model_pred = pixart(
+                out = pixart(
                     x=zt.to(COMPUTE_DTYPE), timestep=t, y=y,
                     aug_level=torch.zeros((zt.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE),
-                    data_info=data_info, adapter_cond=cond,
+                    data_info=d_info, adapter_cond=cond,
                     force_drop_ids=torch.ones(zt.shape[0], device=DEVICE),
-                ).float()
+                )
+                model_pred = out.float()
 
                 alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, zh.shape)
                 sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
@@ -453,7 +383,6 @@ def main():
                 w = get_fixed_loss_weights()
                 loss_edge = torch.tensor(0.0, device=DEVICE)
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
-
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
                 pixel_loss_num_samples = int(pixel_t_mask.sum().item())
                 calc_pixel_loss = ((w['edge_grad'] > 0) or (w.get('lr_cons', 0.0) > 0)) and (pixel_loss_num_samples > 0)
@@ -479,13 +408,12 @@ def main():
                 loss = loss_v + w['latent_l1'] * loss_latent_l1 + w['edge_grad'] * loss_edge + w.get('lr_cons', 0.0) * loss_lr_cons
 
             (loss / GRAD_ACCUM_STEPS).backward()
-            accum_micro_steps += 1
-
-            if accum_micro_steps == GRAD_ACCUM_STEPS:
+            accum += 1
+            if accum == GRAD_ACCUM_STEPS:
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-                accum_micro_steps = 0
+                accum = 0
                 step += 1
                 pbar.update(1)
 
@@ -495,34 +423,33 @@ def main():
                     print(f"[step={step}] loss={float(loss.item()):.4f} v={float(loss_v.item()):.4f} ca_gate_mean={ca_m:.4f}")
 
                 if step % SAVE_EVERY == 0:
-                    save_ckpt(LAST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
+                    save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config)
 
-                if step % VAL_EVERY == 0:
-                    val_res = validate(step, pixart, adapter, vae, val_loader, y, lpips_fn_val_cpu)
-                    best_view = val_res[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_res else next(iter(val_res.values()))
-                    if should_keep_ckpt(best_view["psnr"], best_view["lpips"], best_metrics):
-                        best_metrics = dict(best_view)
-                        save_ckpt(BEST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
-                        print(f"[best@{BEST_VAL_STEPS}] updated {BEST_CKPT_PATH} with PSNR={best_view['psnr']:.4f} SSIM={best_view['ssim']:.6f} LPIPS={best_view['lpips']:.6f}")
-                    save_ckpt(LAST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
+                if (val_loader is not None) and (step % VAL_EVERY == 0):
+                    val_l1 = run_validation(step, pixart, adapter, vae, y, val_loader)
+                    if val_l1 is not None and val_l1 < best_val_l1:
+                        best_val_l1 = val_l1
+                        save_ckpt(BEST_CKPT_PATH, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config)
+                        print(f"[best] updated {BEST_CKPT_PATH} with val_l1={best_val_l1:.6f}")
+                    save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config)
 
                 if step >= MAX_TRAIN_STEPS:
                     break
 
-        # epoch-end leftover grad accumulation flush
-        if accum_micro_steps > 0 and step < MAX_TRAIN_STEPS:
+        if accum > 0 and step < MAX_TRAIN_STEPS:
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
             optimizer.zero_grad()
-            accum_micro_steps = 0
+            accum = 0
             step += 1
             pbar.update(1)
+            if step % SAVE_EVERY == 0:
+                save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config)
 
         epoch += 1
-
-    save_ckpt(LAST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
+    save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config)
     pbar.close()
-    print("✅ MSM-QCA training finished")
+    print("✅ Training finished")
 
 
 if __name__ == "__main__":
