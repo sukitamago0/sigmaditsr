@@ -88,7 +88,7 @@ class SRConvNetMSMQCAAdapter(nn.Module):
         nn.init.zeros_(self.memory_out_proj.bias)
 
         self._shape_logged = False
-        self._pos_cache = {}
+        self._pos_cache_names = {}
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -97,11 +97,12 @@ class SRConvNetMSMQCAAdapter(nn.Module):
     def _build_2d_sincos_tokens(self, feat: torch.Tensor) -> torch.Tensor:
         b, _, h, w = feat.shape
         key = (int(h), int(w))
-        if key not in self._pos_cache:
+        if key not in self._pos_cache_names:
             pos = get_2d_sincos_pos_embed(512, (h, w))  # [h*w, 512]
-            self._pos_cache[key] = torch.from_numpy(pos).float()
-        pos_cpu = self._pos_cache[key]
-        pos = pos_cpu.to(device=feat.device, dtype=feat.dtype)
+            pos_name = f"_pos_tokens_{h}x{w}"
+            self.register_buffer(pos_name, torch.from_numpy(pos).float(), persistent=False)
+            self._pos_cache_names[key] = pos_name
+        pos = getattr(self, self._pos_cache_names[key]).to(device=feat.device, dtype=feat.dtype)
         pos = pos.unsqueeze(0).expand(b, -1, -1)
         return pos
 

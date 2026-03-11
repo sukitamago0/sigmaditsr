@@ -16,6 +16,16 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_msm_qca
+from train_scripts.msm_qca_utils import (
+    DEFAULT_MEMORY_TOKEN_COUNTS,
+    DEFAULT_RESAMPLER_DIM,
+    DEFAULT_RESAMPLER_DEPTH,
+    DEFAULT_RESAMPLER_HEADS,
+    apply_lora_attn_only,
+    load_pixart_subset_compatible,
+    build_msm_qca_config,
+    assert_msm_qca_config_compatible,
+)
 
 ADAPTER_CA_BLOCK_IDS = [14, 18, 22, 26]
 
@@ -34,66 +44,6 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     noise = randn_like_with_generator(z_lr, generator)
     latents = scheduler.add_noise(z_lr, noise, t_start) if hasattr(scheduler, "add_noise") else (z_lr + noise)
     return latents.to(dtype=dtype), timesteps[start_index:]
-
-
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int, alpha: float):
-        super().__init__()
-        self.base = base
-        self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
-        self.lora_A.to(base.weight.device)
-        self.lora_B.to(base.weight.device)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-        self.base.weight.requires_grad = False
-        if self.base.bias is not None:
-            self.base.bias.requires_grad = False
-
-    def forward(self, x):
-        out = self.base(x)
-        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
-        return out + delta.to(out.dtype)
-
-
-def _block_id_from_name(name: str):
-    import re
-    m = re.search(r"blocks\.(\d+)\.", name)
-    return int(m.group(1)) if m else None
-
-
-def apply_lora(model, rank=4, alpha=4):
-    cnt = 0
-    for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-        bid = _block_id_from_name(name)
-        if bid is None or not (0 <= bid <= 27):
-            continue
-        if not (("attn.qkv" in name) or ("attn.proj" in name)):
-            continue
-        parent = model.get_submodule(name.rsplit('.', 1)[0])
-        child = name.rsplit('.', 1)[1]
-        setattr(parent, child, LoRALinear(module, rank, alpha))
-        cnt += 1
-    print(f"✅ Attention LoRA applied to {cnt} layers (rank={rank}, alpha={alpha}).")
-
-
-def _load_pixart_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
-    curr = pixart.state_dict()
-    loaded = skipped_shape = missing_in_model = 0
-    for k, v in saved_trainable.items():
-        if k not in curr:
-            missing_in_model += 1
-            continue
-        if tuple(v.shape) == tuple(curr[k].shape):
-            curr[k] = v.to(dtype=curr[k].dtype)
-            loaded += 1
-        else:
-            skipped_shape += 1
-    pixart.load_state_dict(curr, strict=False)
-    print(f"[{context}] pixart subset load: loaded={loaded}, model_miss={missing_in_model}, shape_skip={skipped_shape}, saved_total={len(saved_trainable)}")
 
 
 @torch.no_grad()
@@ -127,9 +77,24 @@ def run(args):
     lora_rank = int(ckpt.get("lora_rank", args.lora_rank))
     lora_alpha = int(ckpt.get("lora_alpha", args.lora_alpha))
     if has_lora:
-        apply_lora(pixart, rank=lora_rank, alpha=lora_alpha)
+        apply_lora_attn_only(pixart, rank=lora_rank, alpha=lora_alpha)
 
-    _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
+    current_cfg = build_msm_qca_config(
+        adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
+        memory_token_counts=DEFAULT_MEMORY_TOKEN_COUNTS,
+        resampler_dim=DEFAULT_RESAMPLER_DIM,
+        resampler_depth=DEFAULT_RESAMPLER_DEPTH,
+        resampler_heads=DEFAULT_RESAMPLER_HEADS,
+        batch_size=1,
+        grad_accum_steps=1,
+        max_train_steps=1,
+        dataset_name="infer_runtime",
+        crop_size=args.crop_size,
+        scale=4,
+        optimizer_lrs={},
+    )
+    assert_msm_qca_config_compatible(current_cfg, ckpt.get("msm_qca_config", {}), context="infer")
+    load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     miss, unexp = adapter.load_state_dict(ckpt["adapter"], strict=True)
     print(f"[infer-adapter] strict load ok: missing={len(miss)}, unexpected={len(unexp)}")
 

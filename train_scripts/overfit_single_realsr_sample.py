@@ -26,6 +26,17 @@ import matplotlib.pyplot as plt
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_msm_qca
 from diffusion import IDDPM
+from train_scripts.msm_qca_utils import (
+    apply_lora_attn_only as shared_apply_lora_attn_only,
+    configure_trainable_msm_qca as shared_configure_trainable,
+    build_optimizer_msm_qca as shared_make_optimizer,
+    build_msm_qca_config,
+    assert_msm_qca_config_compatible,
+    DEFAULT_MEMORY_TOKEN_COUNTS,
+    DEFAULT_RESAMPLER_DIM,
+    DEFAULT_RESAMPLER_DEPTH,
+    DEFAULT_RESAMPLER_HEADS,
+)
 
 ADAPTER_CA_BLOCK_IDS = [14, 18, 22, 26]
 
@@ -565,7 +576,22 @@ def main():
         lora_rank = int(ckpt["lora_rank"]) if "lora_rank" in ckpt else int(args.lora_rank)
         lora_alpha = int(ckpt["lora_alpha"]) if "lora_alpha" in ckpt else int(args.lora_alpha)
         # same architecture in warm/cold: always materialize LoRA layers
-        apply_lora_attn_only(pixart, rank=lora_rank if has_lora else int(args.lora_rank), alpha=lora_alpha if has_lora else int(args.lora_alpha))
+        shared_apply_lora_attn_only(pixart, rank=lora_rank if has_lora else int(args.lora_rank), alpha=lora_alpha if has_lora else int(args.lora_alpha))
+        current_cfg = build_msm_qca_config(
+            adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
+            memory_token_counts=DEFAULT_MEMORY_TOKEN_COUNTS,
+            resampler_dim=DEFAULT_RESAMPLER_DIM,
+            resampler_depth=DEFAULT_RESAMPLER_DEPTH,
+            resampler_heads=DEFAULT_RESAMPLER_HEADS,
+            batch_size=1,
+            grad_accum_steps=1,
+            max_train_steps=args.train_steps,
+            dataset_name="overfit_runtime",
+            crop_size=args.crop_size,
+            scale=4,
+            optimizer_lrs={},
+        )
+        assert_msm_qca_config_compatible(current_cfg, ckpt.get("msm_qca_config", {}), context="overfit")
         _load_pixart_subset_compatible(pixart, saved_trainable, context="overfit")
         if "adapter" in ckpt:
             miss, unexp = adapter.load_state_dict(ckpt["adapter"], strict=True)
@@ -573,7 +599,7 @@ def main():
 
     elif args.init_mode == "cold":
         # Cold-start: same architecture, random LoRA/bridge/adapters, no warm weights from best checkpoint.
-        apply_lora_attn_only(pixart, rank=int(args.lora_rank), alpha=int(args.lora_alpha))
+        shared_apply_lora_attn_only(pixart, rank=int(args.lora_rank), alpha=int(args.lora_alpha))
     else:
         raise ValueError(f"Unknown init_mode={args.init_mode}")
 
@@ -592,13 +618,14 @@ def main():
         p.requires_grad_(False)
 
     # Disable EMA/condition dropout/condition noise/augmentation sampling by design.
-    configure_trainable(pixart, adapter, disable_adapter=args.disable_adapter, bridge_only_debug=args.bridge_only_debug)
-    optimizer = make_optimizer(
+    shared_configure_trainable(pixart, adapter, disable_adapter=args.disable_adapter, bridge_only_debug=args.bridge_only_debug)
+    optimizer = shared_make_optimizer(
         pixart,
         adapter,
         disable_adapter=args.disable_adapter,
         pixart_lr=args.pixart_lr,
         adapter_lr=args.adapter_lr,
+        weight_decay=0.0,
     )
 
     diffusion = IDDPM(str(1000))

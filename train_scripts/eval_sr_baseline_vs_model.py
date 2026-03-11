@@ -23,6 +23,14 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_msm_qca
+from train_scripts.msm_qca_utils import (
+    DEFAULT_MEMORY_TOKEN_COUNTS,
+    DEFAULT_RESAMPLER_DIM,
+    DEFAULT_RESAMPLER_DEPTH,
+    DEFAULT_RESAMPLER_HEADS,
+    build_msm_qca_config,
+    assert_msm_qca_config_compatible,
+)
 
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -273,6 +281,21 @@ def evaluate(args):
         load_sigma_sr_base_weights(pixart, args.pixart_path)
 
         ckpt = torch.load(args.ckpt_path, map_location="cpu")
+        current_cfg = build_msm_qca_config(
+            adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
+            memory_token_counts=DEFAULT_MEMORY_TOKEN_COUNTS,
+            resampler_dim=DEFAULT_RESAMPLER_DIM,
+            resampler_depth=DEFAULT_RESAMPLER_DEPTH,
+            resampler_heads=DEFAULT_RESAMPLER_HEADS,
+            batch_size=1,
+            grad_accum_steps=1,
+            max_train_steps=1,
+            dataset_name="eval_runtime",
+            crop_size=args.crop_size,
+            scale=4,
+            optimizer_lrs={},
+        )
+        assert_msm_qca_config_compatible(current_cfg, ckpt.get("msm_qca_config", {}), context="eval")
         saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
         has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
         lora_rank = int(ckpt["lora_rank"]) if "lora_rank" in ckpt else 4
