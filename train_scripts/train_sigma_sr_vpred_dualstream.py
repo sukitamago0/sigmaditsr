@@ -224,6 +224,9 @@ TRAIN_STAGE = "single"
 AUTO_STAGE_ENABLED = False
 ENABLE_SELECTIVE_TUNING = False
 ENABLE_LORA = True
+ADAPTER_READ_STAGE = os.getenv("ADAPTER_READ_STAGE", "A").upper()  # A | B
+if ADAPTER_READ_STAGE not in ("A", "B"):
+    raise ValueError(f"Invalid ADAPTER_READ_STAGE={ADAPTER_READ_STAGE}, expected A or B")
 
 # Phase0 safety: check zero-impact regression before training
 RUN_PHASE0_REGRESSION_TEST = False
@@ -1136,14 +1139,18 @@ def apply_lora(model):
     print(f"✅ Attention LoRA applied to {cnt} layers (rank={LORA_RANK}, alpha={LORA_ALPHA}).")
 
 
-def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False):
+def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False, stage: str = "A"):
+    stage = str(stage).upper()
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = ["final_layer", "input_adaln", "input_res_proj", "inject_gate", "cond_route_logits"]
-    if ENABLE_LORA:
-        always_train_keywords.extend(["lora_A", "lora_B"])
+    if stage == "A":
+        always_train_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]
+    else:
+        always_train_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate", "final_layer"]
+        if ENABLE_LORA:
+            always_train_keywords.extend(["lora_A", "lora_B"])
 
     for n, p in pixart.named_parameters():
         if any(k in n for k in always_train_keywords):
@@ -1162,12 +1169,12 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             if ("lora_A" in n) or ("lora_B" in n):
                 bid = _block_id_from_name(n)
                 kind = _lora_target_kind(n)
-                p.requires_grad_(bool(bid is not None and 0 <= bid <= 27 and kind == "attn"))
+                p.requires_grad_(bool(p.requires_grad and bid is not None and 0 <= bid <= 27 and kind == "attn"))
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
-    print(f"✅ PixArt trainable configured(single-stage): before={total_trainable_before}, after={total_trainable_after}")
+    print(f"✅ PixArt trainable configured(stage={stage}): before={total_trainable_before}, after={total_trainable_after}")
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
@@ -1182,51 +1189,58 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    inject_gate_keys = INJECT_GATE_KEYWORDS
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, stage: str = "A"):
+    stage = str(stage).upper()
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
 
-    lora_params = []
-    final_head_params = []
-    bridge_params = []
-
+    pix_lora, pix_final, pix_ca = [], [], []
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
         if ("lora_A" in n) or ("lora_B" in n):
-            lora_params.append(p)
-        elif FINAL_LAYER_KEYWORD in n:
-            final_head_params.append(p)
+            pix_lora.append(p)
+        elif "final_layer" in n:
+            pix_final.append(p)
+        elif ("adapter_ca_" in n) or ("adapter_ca_layers" in n):
+            pix_ca.append(p)
         else:
-            bridge_params.append(p)
+            pix_ca.append(p)
 
     optim_groups = []
-    if len(adapter_params) > 0:
-        optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
-    bridge_and_head = bridge_params + final_head_params
-    if len(bridge_and_head) > 0:
-        optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
-    if len(lora_params) > 0:
-        optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
+    if stage == "A":
+        if len(adapter_params) > 0:
+            optim_groups.append({"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01})
+        if len(pix_ca) > 0:
+            optim_groups.append({"params": pix_ca, "lr": 5e-5, "weight_decay": 0.01})
+    else:
+        if len(adapter_params) > 0:
+            optim_groups.append({"params": adapter_params, "lr": 2e-5, "weight_decay": 0.01})
+        if len(pix_ca) > 0:
+            optim_groups.append({"params": pix_ca, "lr": 2e-5, "weight_decay": 0.01})
+        if len(pix_final) > 0:
+            optim_groups.append({"params": pix_final, "lr": 5e-6, "weight_decay": 0.01})
+        if len(pix_lora) > 0:
+            optim_groups.append({"params": pix_lora, "lr": 5e-6, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params
+    params_to_clip = adapter_params + pix_ca + pix_final + pix_lora
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params
+    grouped = pix_ca + pix_final + pix_lora
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
         raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
 
     group_counts = {
-        "bridge": len(bridge_params),
-        "lora": len(lora_params),
-        "final_head": len(final_head_params),
         "adapter": len(adapter_params),
+        "pix_ca": len(pix_ca),
+        "final_head": len(pix_final),
+        "lora": len(pix_lora),
+        "stage": stage,
     }
     return optimizer, params_to_clip, group_counts
 
@@ -1827,14 +1841,19 @@ def main():
     if not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
         init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
 
-    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
-    for p in adapter.parameters():
-        p.requires_grad_(True)
+    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, stage=ADAPTER_READ_STAGE)
+    for n, p in adapter.named_parameters():
+        if ADAPTER_READ_STAGE == "A":
+            p.requires_grad_(any(k in n for k in ["mem_proj_", "resampler", "memory_out_proj", "memory_ln", "pos_proj", "scale_embed", "q2", "q3", "q4"]))
+        else:
+            p.requires_grad_(True)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
-    print(f"✅ Optim groups(single-stage): {group_counts}")
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter, stage=ADAPTER_READ_STAGE)
+    print(f"✅ Optim groups(stage={ADAPTER_READ_STAGE}): {group_counts}")
     _maybe_empty_cuda_cache()
+
+    print(f"[ShapeCheck][train] depth={getattr(pixart, 'depth', -1)} hidden={getattr(pixart, 'hidden_size', -1)} ca_blocks={getattr(pixart, 'adapter_ca_block_ids', [])}")
 
     ep_start, step, best, _ = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
     if ema is not None:
@@ -2013,6 +2032,16 @@ def main():
                     rL = float(rw[:, 2].mean().item())
                 else:
                     rE = rM = rL = 0.0
+                ca_g = getattr(pixart, "_last_adapter_ca_gates", None)
+                if torch.is_tensor(ca_g):
+                    ca_gate_mean = float(ca_g.mean().item())
+                    ca_gate_norm = float(torch.norm(ca_g, p=2).item())
+                else:
+                    ca_gate_mean = 0.0
+                    ca_gate_norm = 0.0
+                mem_shape = "-"
+                if isinstance(cond_in, dict) and torch.is_tensor(cond_in.get("memory_tokens", None)):
+                    mem_shape = "x".join(str(int(v)) for v in cond_in["memory_tokens"].shape)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2028,9 +2057,12 @@ def main():
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
-                    'rE': f"{rE:.3f}",
-                    'rM': f"{rM:.3f}",
-                    'rL': f"{rL:.3f}",
+                    'ca_g': f"{ca_gate_mean:.3f}",
+                    'ca_n': f"{ca_gate_norm:.3f}",
+                    'm': mem_shape,
+                    'rE_legacy': f"{rE:.3f}",
+                    'rM_legacy': f"{rM:.3f}",
+                    'rL_legacy': f"{rL:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 

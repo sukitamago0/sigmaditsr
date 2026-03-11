@@ -598,6 +598,8 @@ def main():
         if not args.disable_adapter:
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
                 cond = adapter(lr_small.to(dtype=compute_dtype), t_embed=t_embed)
+            if step == 1 and isinstance(cond, dict) and torch.is_tensor(cond.get("memory_tokens", None)):
+                print(f"[ShapeCheck][overfit] memory_tokens={tuple(cond['memory_tokens'].shape)}")
 
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             out = pixart(
@@ -654,10 +656,18 @@ def main():
             else:
                 rE = rM = rL = 0.0
 
+            ca_g = getattr(pixart, "_last_adapter_ca_gates", None)
+            if torch.is_tensor(ca_g):
+                ca_gate_mean = float(ca_g.mean().item())
+                ca_gate_norm = float(torch.norm(ca_g, p=2).item())
+            else:
+                ca_gate_mean = 0.0
+                ca_gate_norm = 0.0
             print(
                 f"[Eval step {step}] full: PSNR={metrics['full']['psnr']:.4f}, "
                 f"SSIM={metrics['full']['ssim']:.4f}, LPIPS={metrics['full']['lpips']:.4f} | "
-                f"route(rE/rM/rL)=({rE:.3f}/{rM:.3f}/{rL:.3f})"
+                f"route_legacy(rE/rM/rL)=({rE:.3f}/{rM:.3f}/{rL:.3f}) | "
+                f"ca_gate(mean/norm)=({ca_gate_mean:.4f}/{ca_gate_norm:.4f})"
             )
             if metrics["roi"] is not None:
                 print(
