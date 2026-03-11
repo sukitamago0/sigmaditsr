@@ -44,6 +44,9 @@ from train_scripts.msm_qca_utils import (
     optimizer_group_lrs,
     structure_consistency_loss,
     edge_guided_losses,
+    get_fixed_loss_weights,
+    sample_t,
+    decode_vae_sample_checkpointed,
     build_msm_qca_config,
     assert_msm_qca_config_compatible,
 )
@@ -65,6 +68,15 @@ SAVE_EVERY = int(os.getenv("SAVE_EVERY", "1000"))
 VAL_EVERY = int(os.getenv("VAL_EVERY", "1000"))
 VAL_STEPS = int(os.getenv("VAL_STEPS", "50"))
 MAX_VAL_SAMPLES = int(os.getenv("MAX_VAL_SAMPLES", "16"))
+
+T_SAMPLE_MODE = os.getenv("T_SAMPLE_MODE", "power")
+T_SAMPLE_POWER = float(os.getenv("T_SAMPLE_POWER", "2.5"))
+T_SAMPLE_MIN = int(os.getenv("T_SAMPLE_MIN", "0"))
+T_SAMPLE_MAX = int(os.getenv("T_SAMPLE_MAX", "999"))
+T_TWO_STAGE_SWITCH = int(os.getenv("T_TWO_STAGE_SWITCH", "15000"))
+MIN_SNR_GAMMA = float(os.getenv("MIN_SNR_GAMMA", "5.0"))
+LATENT_L1_T_MAX = int(os.getenv("LATENT_L1_T_MAX", "250"))
+PIXEL_LOSS_T_MAX = int(os.getenv("PIXEL_LOSS_T_MAX", "250"))
 
 DATASET_NAME = os.getenv("TRAIN_DATASET_NAME", "DF2K+RealSR")
 CROP_SIZE = int(os.getenv("CROP_SIZE", str(DEFAULT_DATA_CONFIG["crop_size"])))
@@ -292,8 +304,11 @@ def main():
     accum = 0
     optimizer.zero_grad()
     pbar = tqdm(total=MAX_TRAIN_STEPS, desc="train_msm_qca", initial=step)
+    epoch = 0
+    params_to_clip = [p for p in list(pixart.parameters()) + list(adapter.parameters()) if p.requires_grad]
     while step < MAX_TRAIN_STEPS:
-        for batch in train_loader:
+        train_ds.set_epoch(epoch)
+        for i, batch in enumerate(train_loader):
             hr = batch["hr"].to(DEVICE)
             lr = batch["lr"].to(DEVICE)
             lr_small = batch["lr_small"].to(DEVICE, dtype=COMPUTE_DTYPE)
@@ -301,7 +316,16 @@ def main():
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
 
-            t = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
+            t = sample_t(
+                batch=zh.shape[0],
+                device=DEVICE,
+                step=step,
+                mode=T_SAMPLE_MODE,
+                power=T_SAMPLE_POWER,
+                tmin=T_SAMPLE_MIN,
+                tmax=T_SAMPLE_MAX,
+                two_stage_switch=T_TWO_STAGE_SWITCH,
+            )
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
@@ -313,24 +337,60 @@ def main():
                     aug_level=torch.zeros((zt.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE),
                     data_info=d_info, adapter_cond=cond,
                     force_drop_ids=torch.ones(zt.shape[0], device=DEVICE),
-                ).float()
+                )
+                model_pred = out.float()
 
                 alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, zh.shape)
                 sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
                 target_v = alpha_t * noise - sigma_t * zh.float()
-                loss_v = F.mse_loss(out, target_v)
 
-                z0 = alpha_t * zt.float() - sigma_t * out
-                loss_latent_l1 = F.l1_loss(z0, zh.float())
-                pred = vae.decode(z0 / vae.config.scaling_factor).sample.clamp(-1, 1)
-                loss_lr_cons = structure_consistency_loss(pred, lr)
-                loss_edge, _, _ = edge_guided_losses(pred, hr)
-                loss = loss_v + 0.10 * loss_latent_l1 + 0.05 * loss_lr_cons + 0.01 * loss_edge
+                alpha_s = alpha_t[:, 0, 0, 0]
+                sigma_s = sigma_t[:, 0, 0, 0]
+                snr = (alpha_s ** 2) / (sigma_s ** 2)
+                min_snr_gamma = torch.minimum(snr, torch.full_like(snr, float(MIN_SNR_GAMMA)))
+                loss_weights = min_snr_gamma / snr
+                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3]) * loss_weights).mean()
+
+                z0 = alpha_t * zt.float() - sigma_t * model_pred
+
+                latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
+                latent_l1_mask = (t <= int(LATENT_L1_T_MAX)).float()
+                if float(latent_l1_mask.sum().item()) > 0:
+                    loss_latent_l1 = (latent_l1_per * latent_l1_mask).sum() / latent_l1_mask.sum().clamp_min(1.0)
+                else:
+                    loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
+
+                w = get_fixed_loss_weights()
+                loss_edge = torch.tensor(0.0, device=DEVICE)
+                loss_lr_cons = torch.tensor(0.0, device=DEVICE)
+                pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
+                pixel_loss_num_samples = int(pixel_t_mask.sum().item())
+                calc_pixel_loss = ((w['edge_grad'] > 0) or (w.get('lr_cons', 0.0) > 0)) and (pixel_loss_num_samples > 0)
+                if calc_pixel_loss:
+                    active_idx = torch.nonzero(pixel_t_mask, as_tuple=False).squeeze(1)
+                    top = torch.randint(0, 25, (1,), device=DEVICE).item()
+                    left = torch.randint(0, 25, (1,), device=DEVICE).item()
+                    z0_sel = z0.index_select(0, active_idx)
+                    hr_sel = hr.index_select(0, active_idx)
+                    lr_sel = lr.index_select(0, active_idx)
+                    z0_crop = z0_sel[..., top:top + 40, left:left + 40]
+                    img_p_raw = decode_vae_sample_checkpointed(vae, z0_crop / vae.config.scaling_factor).clamp(-1, 1)
+                    img_p_valid = img_p_raw[..., 32:-32, 32:-32]
+                    y0 = top * 8 + 32
+                    x0 = left * 8 + 32
+                    img_t_valid = hr_sel[..., y0:y0 + 256, x0:x0 + 256].clamp(-1, 1)
+                    if w['edge_grad'] > 0:
+                        loss_edge, _, _ = edge_guided_losses(img_p_valid, img_t_valid)
+                    if w.get('lr_cons', 0.0) > 0:
+                        lr_patch = lr_sel[..., y0:y0 + 256, x0:x0 + 256].clamp(-1, 1)
+                        loss_lr_cons = structure_consistency_loss(img_p_valid, lr_patch)
+
+                loss = loss_v + w['latent_l1'] * loss_latent_l1 + w['edge_grad'] * loss_edge + w.get('lr_cons', 0.0) * loss_lr_cons
 
             (loss / GRAD_ACCUM_STEPS).backward()
             accum += 1
-            if accum >= GRAD_ACCUM_STEPS:
-                torch.nn.utils.clip_grad_norm_([p for p in list(pixart.parameters()) + list(adapter.parameters()) if p.requires_grad], 1.0)
+            if accum == GRAD_ACCUM_STEPS:
+                torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 accum = 0
@@ -355,9 +415,18 @@ def main():
 
                 if step >= MAX_TRAIN_STEPS:
                     break
-        if step >= MAX_TRAIN_STEPS:
-            break
 
+        if accum > 0 and step < MAX_TRAIN_STEPS:
+            torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            accum = 0
+            step += 1
+            pbar.update(1)
+            if step % SAVE_EVERY == 0:
+                save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config)
+
+        epoch += 1
     save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_val_l1, msm_qca_config)
     pbar.close()
     print("✅ Training finished")

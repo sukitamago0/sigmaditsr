@@ -416,6 +416,48 @@ def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> 
     return 0.4 * loss_sobel + 0.4 * loss_lap + 0.2 * loss_lowfreq
 
 
+
+
+def get_fixed_loss_weights():
+    return {
+        "mse": 1.0,
+        "latent_l1": 0.10,
+        "lpips": 0.0,
+        "edge_grad": 0.01,
+        "flat_hf": 0.0,
+        "lr_cons": 0.05,
+    }
+
+
+def sample_t(batch: int, device: str, step: int, *, mode: str = "power", power: float = 2.5, tmin: int = 0, tmax: int = 999, two_stage_switch: int = 15000) -> torch.Tensor:
+    tmin = int(max(0, tmin))
+    tmax = int(min(999, tmax))
+    if tmax < tmin:
+        tmax = tmin
+
+    mode = str(mode).lower()
+    if mode == "uniform":
+        return torch.randint(tmin, tmax + 1, (batch,), device=device).long()
+    if mode == "power":
+        u = torch.rand((batch,), device=device)
+        span = float(max(1, tmax - tmin))
+        t = torch.floor((u ** float(power)) * span + tmin)
+        return t.clamp(tmin, tmax).long()
+    if mode == "two_stage":
+        if int(step) < int(two_stage_switch):
+            u = torch.rand((batch,), device=device)
+            span = float(max(1, tmax - tmin))
+            t = torch.floor((u ** float(power)) * span + tmin)
+            return t.clamp(tmin, tmax).long()
+        return torch.randint(tmin, tmax + 1, (batch,), device=device).long()
+    raise ValueError(f"Unknown t-sample mode: {mode}")
+
+
+def decode_vae_sample_checkpointed(vae: nn.Module, latents: torch.Tensor) -> torch.Tensor:
+    def _decode_fn(z):
+        return vae.decode(z).sample
+    return torch.utils.checkpoint.checkpoint(_decode_fn, latents, use_reentrant=False)
+
 def build_msm_qca_config(*, adapter_ca_block_ids, memory_token_counts, resampler_dim, resampler_depth, resampler_heads, batch_size, grad_accum_steps, max_train_steps, dataset_name, crop_size, scale, optimizer_lrs):
     return {
         "model_variant": "msm_qca",
