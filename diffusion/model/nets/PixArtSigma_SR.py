@@ -10,7 +10,7 @@ from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 @MODELS.register_module()
 class PixArtSigmaSR(PixArtMS):
-    def __init__(self, force_null_caption: bool = True, **kwargs):
+    def __init__(self, force_null_caption: bool = True, adapter_ca_block_ids=None, **kwargs):
         kwargs.setdefault("model_max_length", 300)
         kwargs.setdefault("pred_sigma", False)
         kwargs.setdefault("learn_sigma", False)
@@ -29,30 +29,18 @@ class PixArtSigmaSR(PixArtMS):
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
-        # legacy (kept for ckpt compatibility; no longer used as primary path)
-        self.injection_layers = list(range(self.depth))
-        self.input_adapter_ln = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
-        self.input_adaln = nn.ModuleList([nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True) for _ in range(self.depth)])
-        self.input_res_proj = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(self.depth)])
-        self.inject_gate = nn.Parameter(torch.full((self.depth,), -4.0))
-        self.cond_route_logits = nn.Parameter(torch.zeros(self.depth, 3))
-
-        for lin in self.input_adaln:
-            nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
-            nn.init.zeros_(lin.bias)
-        for lin in self.input_res_proj:
-            nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
-            nn.init.zeros_(lin.bias)
-
         # sparse decoupled adapter cross-attention branch
-        if self.depth == 28:
-            self.adapter_ca_block_ids = [14, 18, 22, 26]
+        if adapter_ca_block_ids is None:
+            if self.depth == 28:
+                self.adapter_ca_block_ids = [14, 18, 22, 26]
+            else:
+                ratios = [0.50, 0.64, 0.78, 0.93]
+                cand = sorted(set(min(self.depth - 1, max(0, int(round((self.depth - 1) * r)))) for r in ratios))
+                while len(cand) < 4:
+                    cand.append(cand[-1])
+                self.adapter_ca_block_ids = cand[:4]
         else:
-            ratios = [0.50, 0.64, 0.78, 0.93]
-            cand = sorted(set(min(self.depth - 1, max(0, int(round((self.depth - 1) * r)))) for r in ratios))
-            while len(cand) < 4:
-                cand.append(cand[-1])
-            self.adapter_ca_block_ids = cand[:4]
+            self.adapter_ca_block_ids = [int(x) for x in adapter_ca_block_ids]
 
         head_nums = []
         for bid in self.adapter_ca_block_ids:
@@ -70,7 +58,8 @@ class PixArtSigmaSR(PixArtMS):
             nn.MultiheadAttention(self.hidden_size, self.adapter_ca_num_heads, batch_first=True) for _ in self.adapter_ca_block_ids
         ])
         self.adapter_ca_out = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size) for _ in self.adapter_ca_block_ids])
-        self.adapter_ca_gate = nn.Parameter(torch.zeros(len(self.adapter_ca_block_ids)))
+        # use logit gate for small but non-zero initial impact and non-dead branch
+        self.adapter_ca_gate = nn.Parameter(torch.full((len(self.adapter_ca_block_ids),), -4.0))
         self._adapter_ca_index = {bid: i for i, bid in enumerate(self.adapter_ca_block_ids)}
 
         for out in self.adapter_ca_out:
@@ -88,7 +77,7 @@ class PixArtSigmaSR(PixArtMS):
         q = self.adapter_ca_norm_q[idx](x)
         delta, _ = self.adapter_ca_layers[idx](q, memory_tokens, memory_tokens, need_weights=False)
         delta = self.adapter_ca_out[idx](delta)
-        gate = self.adapter_ca_gate[idx].to(dtype=x.dtype)
+        gate = torch.sigmoid(self.adapter_ca_gate[idx]).to(dtype=x.dtype)
         x = x + gate * delta.to(dtype=x.dtype)
         return x
 
@@ -116,9 +105,6 @@ class PixArtSigmaSR(PixArtMS):
         memory_tokens = None
         if isinstance(adapter_cond, dict):
             memory_tokens = adapter_cond.get("memory_tokens", None)
-            if memory_tokens is None:
-                # legacy fallback for old experiments/checkpoints
-                memory_tokens = adapter_cond.get("cond_tokens", None)
 
         if memory_tokens is not None:
             memory_tokens = memory_tokens.to(dtype=x.dtype)
@@ -141,9 +127,6 @@ class PixArtSigmaSR(PixArtMS):
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
-        # legacy metric only; path is unused
-        self._last_route_weights = torch.softmax(self.cond_route_logits.detach(), dim=1).cpu()
-
         for i, block in enumerate(self.blocks):
             x = auto_grad_checkpoint(
                 block,
@@ -162,7 +145,7 @@ class PixArtSigmaSR(PixArtMS):
             if (memory_tokens is not None) and (i in self._adapter_ca_index):
                 x = self._apply_adapter_ca(x, i, memory_tokens)
 
-        self._last_adapter_ca_gates = self.adapter_ca_gate.detach().float().cpu()
+        self._last_adapter_ca_gates = torch.sigmoid(self.adapter_ca_gate.detach().float()).cpu()
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)

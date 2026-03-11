@@ -44,12 +44,12 @@ class MultiScaleMemoryResampler(nn.Module):
         return q2, q3, q4
 
 
-class SRConvNetLSAAdapter(nn.Module):
+class SRConvNetMSMQCAAdapter(nn.Module):
     def __init__(self, hidden_size: int = 1152):
         super().__init__()
         self.hidden_size = int(hidden_size)
 
-        # keep existing backbone
+        # keep existing SRConvNet-style backbone and time FiLM
         self.stem = nn.Conv2d(3, 64, 3, padding=1)
         self.stage1 = nn.Sequential(SRConvNetBlock(64), SRConvNetBlock(64))
         self.down1 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
@@ -63,23 +63,15 @@ class SRConvNetLSAAdapter(nn.Module):
             nn.Linear(self.hidden_size, 2 * (64 + 128 + 256 + 256)),
         )
 
-        self.proj2 = nn.Conv2d(128, 256, 1)
-        self.proj3 = nn.Conv2d(256, 256, 1)
-        self.proj4 = nn.Conv2d(256, 256, 1)
-
-        # legacy heads: kept for checkpoint compatibility only (unused in new forward path)
-        self.out_proj_early = nn.Conv2d(512, self.hidden_size, 1)
-        self.out_proj_mid = nn.Conv2d(512, self.hidden_size, 1)
-        self.out_proj_late = nn.Conv2d(768, self.hidden_size, 1)
-
-        # new memory path
+        # multi-scale feature projections to memory token dim
         self.mem_proj_f2 = nn.Conv2d(128, 512, 1)
         self.mem_proj_f3 = nn.Conv2d(256, 512, 1)
         self.mem_proj_f4 = nn.Conv2d(256, 512, 1)
 
-        self.pos_proj = nn.Linear(4, 512)
+        # standard sin-cos style positional encoding + scale embedding
         self.scale_embed = nn.Parameter(torch.zeros(3, 512))
 
+        # learnable latent queries
         self.q2 = nn.Parameter(torch.randn(64, 512) * 0.02)
         self.q3 = nn.Parameter(torch.randn(32, 512) * 0.02)
         self.q4 = nn.Parameter(torch.randn(16, 512) * 0.02)
@@ -88,22 +80,9 @@ class SRConvNetLSAAdapter(nn.Module):
         self.memory_out_proj = nn.Linear(512, self.hidden_size)
         self.memory_ln = nn.LayerNorm(self.hidden_size)
 
-        for m in [
-            self.proj2,
-            self.proj3,
-            self.proj4,
-            self.out_proj_early,
-            self.out_proj_mid,
-            self.out_proj_late,
-            self.mem_proj_f2,
-            self.mem_proj_f3,
-            self.mem_proj_f4,
-        ]:
+        for m in [self.mem_proj_f2, self.mem_proj_f3, self.mem_proj_f4]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
-
-        nn.init.xavier_uniform_(self.pos_proj.weight)
-        nn.init.zeros_(self.pos_proj.bias)
         nn.init.xavier_uniform_(self.memory_out_proj.weight)
         nn.init.zeros_(self.memory_out_proj.bias)
 
@@ -113,25 +92,31 @@ class SRConvNetLSAAdapter(nn.Module):
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         return (1.0 + gamma[:, :, None, None]) * feat + beta[:, :, None, None]
 
-    def _build_pos_tokens(self, feat: torch.Tensor) -> torch.Tensor:
+    def _build_2d_sincos_tokens(self, feat: torch.Tensor) -> torch.Tensor:
         b, _, h, w = feat.shape
         yy, xx = torch.meshgrid(
             torch.linspace(-1.0, 1.0, h, device=feat.device, dtype=feat.dtype),
             torch.linspace(-1.0, 1.0, w, device=feat.device, dtype=feat.dtype),
             indexing="ij",
         )
-        rr = torch.sqrt(xx * xx + yy * yy)
-        ang = torch.atan2(yy, xx) / math.pi
-        pos = torch.stack([xx, yy, rr, ang], dim=-1).view(1, h * w, 4).repeat(b, 1, 1)
-        return self.pos_proj(pos.float()).to(dtype=feat.dtype)
+        # 4-d sin/cos basis
+        pos = torch.stack([torch.sin(math.pi * xx), torch.cos(math.pi * xx), torch.sin(math.pi * yy), torch.cos(math.pi * yy)], dim=0)
+        pos = pos.view(1, 4, h * w).permute(0, 2, 1).repeat(b, 1, 1)
+        # expand to 512 by tiled repeat + trim
+        rep = (512 + 3) // 4
+        pos = pos.repeat(1, 1, rep)[..., :512]
+        return pos
 
     def _tokenize_with_pos_scale(self, feat: torch.Tensor, scale_id: int) -> torch.Tensor:
         tok = feat.flatten(2).transpose(1, 2)
-        pos = self._build_pos_tokens(feat)
+        pos = self._build_2d_sincos_tokens(feat).to(dtype=tok.dtype)
         tok = tok + pos + self.scale_embed[scale_id].view(1, 1, -1).to(dtype=tok.dtype)
         return tok
 
     def forward(self, lr_small: torch.Tensor, t_embed: torch.Tensor = None):
+        if lr_small.shape[1] != 3:
+            raise ValueError(f"Expected lr_small RGB input with 3 channels, got {lr_small.shape[1]}")
+
         f1 = self.stage1(self.stem(lr_small))
         f2 = self.stage2(self.down1(f1))
         f3 = self.stage3(self.down2(f2))
@@ -146,7 +131,6 @@ class SRConvNetLSAAdapter(nn.Module):
             f3 = self._film(f3, g3, b3)
             f4 = self._film(f4, g4, b4)
 
-        # channel checks from real implementation
         if not self._shape_logged:
             print(
                 f"[AdapterShapeCheck] f2={tuple(f2.shape)} f3={tuple(f3.shape)} f4={tuple(f4.shape)} "
@@ -178,11 +162,16 @@ class SRConvNetLSAAdapter(nn.Module):
         }
 
 
-def build_adapter_v8(in_channels=3, hidden_size=1152, injection_layers_map=None):
+def build_adapter_msm_qca(in_channels=3, hidden_size=1152, injection_layers_map=None):
     del in_channels, injection_layers_map
-    return SRConvNetLSAAdapter(hidden_size=hidden_size)
+    return SRConvNetMSMQCAAdapter(hidden_size=hidden_size)
+
+
+# compatibility aliases
+
+def build_adapter_v8(in_channels=3, hidden_size=1152, injection_layers_map=None):
+    return build_adapter_msm_qca(in_channels=in_channels, hidden_size=hidden_size, injection_layers_map=injection_layers_map)
 
 
 def build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=None):
-    del in_channels, injection_layers_map
-    return SRConvNetLSAAdapter(hidden_size=hidden_size)
+    return build_adapter_msm_qca(in_channels=in_channels, hidden_size=hidden_size, injection_layers_map=injection_layers_map)

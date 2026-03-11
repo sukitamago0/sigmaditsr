@@ -24,7 +24,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 import matplotlib.pyplot as plt
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.nets.adapter import build_adapter_msm_qca
 from diffusion import IDDPM
 
 
@@ -441,13 +441,13 @@ def save_visuals(out_dir, step, hr, lr, pred, local_roi):
         plt.close(fig)
 
 
-def configure_trainable(pixart, adapter, disable_adapter=False):
+def configure_trainable(pixart, adapter, disable_adapter=False, bridge_only_debug=False):
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
     for _, p in adapter.named_parameters():
         p.requires_grad_(False)
 
-    allow = ["final_layer", "input_adaln", "input_res_proj", "inject_gate", "cond_route_logits", "lora_A", "lora_B"]
+    allow = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate", "final_layer", "lora_A", "lora_B"]
     for n, p in pixart.named_parameters():
         if any(k in n for k in allow):
             p.requires_grad_(True)
@@ -455,6 +455,9 @@ def configure_trainable(pixart, adapter, disable_adapter=False):
     if not disable_adapter:
         for _, p in adapter.named_parameters():
             p.requires_grad_(True)
+        if bridge_only_debug:
+            for n, p in adapter.named_parameters():
+                p.requires_grad_(any(k in n for k in ["mem_proj_", "resampler", "memory_out_proj", "memory_ln", "scale_embed", "q2", "q3", "q4"]))
 
 
 def make_optimizer(pixart, adapter, disable_adapter=False, pixart_lr=1e-5, adapter_lr=3e-5):
@@ -481,6 +484,7 @@ def main():
     parser.add_argument("--roi", type=str, default="")
     parser.add_argument("--crop_size", type=int, default=512)
     parser.add_argument("--disable_adapter", action="store_true")
+    parser.add_argument("--bridge_only_debug", action="store_true")
     parser.add_argument("--train_steps", type=int, default=400)
     parser.add_argument("--save_every", type=int, default=50)
     parser.add_argument("--infer_steps", type=int, default=50)
@@ -526,7 +530,7 @@ def main():
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
-    adapter = build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(device).float()
+    adapter = build_adapter_msm_qca(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(device).float()
 
     print(f"[Overfit] init_mode={args.init_mode}")
     if args.init_mode == "warm":
@@ -537,14 +541,14 @@ def main():
         has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
         lora_rank = int(ckpt["lora_rank"]) if "lora_rank" in ckpt else int(args.lora_rank)
         lora_alpha = int(ckpt["lora_alpha"]) if "lora_alpha" in ckpt else int(args.lora_alpha)
-        if has_lora:
-            apply_lora_attn_only(pixart, rank=lora_rank, alpha=lora_alpha)
+        # same architecture in warm/cold: always materialize LoRA layers
+        apply_lora_attn_only(pixart, rank=lora_rank if has_lora else int(args.lora_rank), alpha=lora_alpha if has_lora else int(args.lora_alpha))
         _load_pixart_subset_compatible(pixart, saved_trainable, context="overfit")
         if "adapter" in ckpt:
             load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="overfit-adapter")
     elif args.init_mode == "cold":
-        # Cold-start: only pretrained PixArt base is loaded; do NOT load ckpt subset/adapter/LoRA.
-        pass
+        # Cold-start: same architecture, random LoRA/bridge/adapters, no warm weights from best checkpoint.
+        apply_lora_attn_only(pixart, rank=int(args.lora_rank), alpha=int(args.lora_alpha))
     else:
         raise ValueError(f"Unknown init_mode={args.init_mode}")
 
@@ -563,7 +567,7 @@ def main():
         p.requires_grad_(False)
 
     # Disable EMA/condition dropout/condition noise/augmentation sampling by design.
-    configure_trainable(pixart, adapter, disable_adapter=args.disable_adapter)
+    configure_trainable(pixart, adapter, disable_adapter=args.disable_adapter, bridge_only_debug=args.bridge_only_debug)
     optimizer = make_optimizer(
         pixart,
         adapter,
@@ -648,14 +652,6 @@ def main():
                     pixart, adapter, vae, hr, lr, lr_small, y_embed, data_info, args, device, compute_dtype, lpips_fn
                 )
 
-            route_w = getattr(pixart, "_last_route_weights", None)
-            if torch.is_tensor(route_w):
-                rE = float(route_w[:, 0].mean().item())
-                rM = float(route_w[:, 1].mean().item())
-                rL = float(route_w[:, 2].mean().item())
-            else:
-                rE = rM = rL = 0.0
-
             ca_g = getattr(pixart, "_last_adapter_ca_gates", None)
             if torch.is_tensor(ca_g):
                 ca_gate_mean = float(ca_g.mean().item())
@@ -666,7 +662,6 @@ def main():
             print(
                 f"[Eval step {step}] full: PSNR={metrics['full']['psnr']:.4f}, "
                 f"SSIM={metrics['full']['ssim']:.4f}, LPIPS={metrics['full']['lpips']:.4f} | "
-                f"route_legacy(rE/rM/rL)=({rE:.3f}/{rM:.3f}/{rL:.3f}) | "
                 f"ca_gate(mean/norm)=({ca_gate_mean:.4f}/{ca_gate_norm:.4f})"
             )
             if metrics["roi"] is not None:

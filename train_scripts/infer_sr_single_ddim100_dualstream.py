@@ -16,7 +16,7 @@ from PIL import Image
 from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.nets.adapter import build_adapter_msm_qca
 
 
 def randn_like_with_generator(tensor, generator):
@@ -176,7 +176,7 @@ def run(args):
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
-        in_channels=4,
+        in_channels=3,
         out_channels=4,
         sparse_inject_ratio=1.0,
         
@@ -205,8 +205,8 @@ def run(args):
     else:
         load_state_dict_shape_compatible(pixart, base, context="infer-base-pretrain")
 
-    adapter = build_adapter_v7(
-        in_channels=4,
+    adapter = build_adapter_msm_qca(
+        in_channels=3,
         hidden_size=1152,
         injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
     ).to(device).float()

@@ -45,7 +45,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.nets.adapter import build_adapter_msm_qca
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -54,8 +54,8 @@ BASE_PIXART_SHA256 = None
 
 # Added "aug_embedder" to required keys
 V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
-    "input_adaln", "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj",
-    "input_adapter_ln", "style_fusion_mlp", "aug_embedder", "injection_scales"
+    "adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate",
+    "final_layer", "lora_A", "lora_B"
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
@@ -95,7 +95,7 @@ VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
 NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth")
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
-INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
+INIT_CKPT_PATH = ""  # disabled by default for current MSM-QCA mainline
 OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
@@ -224,9 +224,7 @@ TRAIN_STAGE = "single"
 AUTO_STAGE_ENABLED = False
 ENABLE_SELECTIVE_TUNING = False
 ENABLE_LORA = True
-ADAPTER_READ_STAGE = os.getenv("ADAPTER_READ_STAGE", "A").upper()  # A | B
-if ADAPTER_READ_STAGE not in ("A", "B"):
-    raise ValueError(f"Invalid ADAPTER_READ_STAGE={ADAPTER_READ_STAGE}, expected A or B")
+BRIDGE_ONLY_DEBUG = os.getenv("BRIDGE_ONLY_DEBUG", "0") == "1"
 
 # Phase0 safety: check zero-impact regression before training
 RUN_PHASE0_REGRESSION_TEST = False
@@ -577,9 +575,8 @@ class ParamEMA:
 
 def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = "small"):
     names = (
-        "alpha_struct", "alpha_trans", "alpha_detail", "input_adaln", "input_res_proj", "style_fusion_mlp", "input_adapter_ln",
-        "aug_embedder", "injection_scales", "csft_dw", "csft_pw", "final_layer", "lora_A", "lora_B", "x_embedder",
-        "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate"
+        "adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate",
+        "final_layer", "lora_A", "lora_B", "memory_out_proj", "resampler", "mem_proj_", "q2", "q3", "q4"
     )
     out = []
     for n, p in adapter.named_parameters():
@@ -1139,22 +1136,23 @@ def apply_lora(model):
     print(f"✅ Attention LoRA applied to {cnt} layers (rank={LORA_RANK}, alpha={LORA_ALPHA}).")
 
 
-def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False, stage: str = "A"):
-    stage = str(stage).upper()
+def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False, bridge_only_debug: bool = False):
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    if stage == "A":
-        always_train_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]
-    else:
-        always_train_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate", "final_layer"]
-        if ENABLE_LORA:
-            always_train_keywords.extend(["lora_A", "lora_B"])
+    always_train_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate", "final_layer"]
+    if ENABLE_LORA:
+        always_train_keywords.extend(["lora_A", "lora_B"])
 
     for n, p in pixart.named_parameters():
         if any(k in n for k in always_train_keywords):
             p.requires_grad_(True)
+
+    if bridge_only_debug:
+        for n, p in pixart.named_parameters():
+            if "final_layer" in n or "lora_" in n:
+                p.requires_grad_(False)
 
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
@@ -1174,7 +1172,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
-    print(f"✅ PixArt trainable configured(stage={stage}): before={total_trainable_before}, after={total_trainable_after}")
+    print(f"✅ PixArt trainable configured(single-stage): before={total_trainable_before}, after={total_trainable_after}, bridge_only_debug={bridge_only_debug}")
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
@@ -1189,11 +1187,18 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, stage: str = "A"):
-    stage = str(stage).upper()
-    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
+    # single-stage: bridge high lr, adapter backbone medium lr, lora/final low lr
+    adapter_bridge, adapter_backbone = [], []
+    for n, p in adapter.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(k in n for k in ["mem_proj_", "resampler", "memory_out_proj", "memory_ln", "scale_embed", "q2", "q3", "q4"]):
+            adapter_bridge.append(p)
+        else:
+            adapter_backbone.append(p)
 
-    pix_lora, pix_final, pix_ca = [], [], []
+    pix_lora, pix_final, pix_bridge = [], [], []
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
@@ -1201,46 +1206,34 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, stage:
             pix_lora.append(p)
         elif "final_layer" in n:
             pix_final.append(p)
-        elif ("adapter_ca_" in n) or ("adapter_ca_layers" in n):
-            pix_ca.append(p)
+        elif any(k in n for k in ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]):
+            pix_bridge.append(p)
         else:
-            pix_ca.append(p)
+            pix_bridge.append(p)
 
     optim_groups = []
-    if stage == "A":
-        if len(adapter_params) > 0:
-            optim_groups.append({"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01})
-        if len(pix_ca) > 0:
-            optim_groups.append({"params": pix_ca, "lr": 5e-5, "weight_decay": 0.01})
-    else:
-        if len(adapter_params) > 0:
-            optim_groups.append({"params": adapter_params, "lr": 2e-5, "weight_decay": 0.01})
-        if len(pix_ca) > 0:
-            optim_groups.append({"params": pix_ca, "lr": 2e-5, "weight_decay": 0.01})
-        if len(pix_final) > 0:
-            optim_groups.append({"params": pix_final, "lr": 5e-6, "weight_decay": 0.01})
-        if len(pix_lora) > 0:
-            optim_groups.append({"params": pix_lora, "lr": 5e-6, "weight_decay": 0.01})
+    if len(adapter_bridge) > 0:
+        optim_groups.append({"params": adapter_bridge, "lr": 1e-4, "weight_decay": 0.01})
+    if len(adapter_backbone) > 0:
+        optim_groups.append({"params": adapter_backbone, "lr": 3e-5, "weight_decay": 0.01})
+    if len(pix_bridge) > 0:
+        optim_groups.append({"params": pix_bridge, "lr": 5e-5, "weight_decay": 0.01})
+    low = pix_final + pix_lora
+    if len(low) > 0:
+        optim_groups.append({"params": low, "lr": 5e-6, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
-        raise RuntimeError("No optimizer groups built; check stage trainable settings.")
+        raise RuntimeError("No optimizer groups built; check trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + pix_ca + pix_final + pix_lora
-
-    pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = pix_ca + pix_final + pix_lora
-    if len({id(p) for p in grouped}) != len(grouped):
-        raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
-    if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
-        raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
+    params_to_clip = adapter_bridge + adapter_backbone + pix_bridge + pix_final + pix_lora
 
     group_counts = {
-        "adapter": len(adapter_params),
-        "pix_ca": len(pix_ca),
+        "adapter_bridge": len(adapter_bridge),
+        "adapter_backbone": len(adapter_backbone),
+        "pix_bridge": len(pix_bridge),
         "final_head": len(pix_final),
         "lora": len(pix_lora),
-        "stage": stage,
     }
     return optimizer, params_to_clip, group_counts
 
@@ -1252,9 +1245,9 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("pixart.input_res_proj.0.weight", pix_named.get("input_res_proj.0.weight", None)),
-        ("pixart.input_adaln.0.weight", pix_named.get("input_adaln.0.weight", None)),
-        ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
+        ("pixart.adapter_ca_out.0.weight", pix_named.get("adapter_ca_out.0.weight", None)),
+        ("pixart.adapter_ca_gate", pix_named.get("adapter_ca_gate", None)),
+        ("adapter.memory_out_proj.weight", ad_named.get("memory_out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
@@ -1793,7 +1786,7 @@ def main():
         print("ℹ️ LoRA disabled.")
     pixart.train()
 
-    adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
+    adapter = build_adapter_msm_qca(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
@@ -1838,19 +1831,16 @@ def main():
     print(f"📏 EMA validation frequency: every {EMA_VALIDATE_EVERY} validations")
     print("📏 Raw validation frequency: every validation trigger")
 
-    if not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
-        init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
-
-    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, stage=ADAPTER_READ_STAGE)
-    for n, p in adapter.named_parameters():
-        if ADAPTER_READ_STAGE == "A":
-            p.requires_grad_(any(k in n for k in ["mem_proj_", "resampler", "memory_out_proj", "memory_ln", "pos_proj", "scale_embed", "q2", "q3", "q4"]))
-        else:
-            p.requires_grad_(True)
+    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, bridge_only_debug=BRIDGE_ONLY_DEBUG)
+    for p in adapter.parameters():
+        p.requires_grad_(True)
+    if BRIDGE_ONLY_DEBUG:
+        for n, p in adapter.named_parameters():
+            p.requires_grad_(any(k in n for k in ["mem_proj_", "resampler", "memory_out_proj", "memory_ln", "scale_embed", "q2", "q3", "q4"]))
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter, stage=ADAPTER_READ_STAGE)
-    print(f"✅ Optim groups(stage={ADAPTER_READ_STAGE}): {group_counts}")
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
+    print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
     print(f"[ShapeCheck][train] depth={getattr(pixart, 'depth', -1)} hidden={getattr(pixart, 'hidden_size', -1)} ca_blocks={getattr(pixart, 'adapter_ca_block_ids', [])}")
@@ -2025,13 +2015,6 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
-                rw = getattr(pixart, "_last_route_weights", None)
-                if torch.is_tensor(rw):
-                    rE = float(rw[:, 0].mean().item())
-                    rM = float(rw[:, 1].mean().item())
-                    rL = float(rw[:, 2].mean().item())
-                else:
-                    rE = rM = rL = 0.0
                 ca_g = getattr(pixart, "_last_adapter_ca_gates", None)
                 if torch.is_tensor(ca_g):
                     ca_gate_mean = float(ca_g.mean().item())
@@ -2060,9 +2043,6 @@ def main():
                     'ca_g': f"{ca_gate_mean:.3f}",
                     'ca_n': f"{ca_gate_norm:.3f}",
                     'm': mem_shape,
-                    'rE_legacy': f"{rE:.3f}",
-                    'rM_legacy': f"{rM:.3f}",
-                    'rL_legacy': f"{rL:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
