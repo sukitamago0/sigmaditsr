@@ -298,20 +298,20 @@ def build_optimizer_msm_qca(
     pixart_low_lr: float = 5e-6,
     weight_decay: float = 0.01,
 ):
-    pixart_readout_bridge, pixart_low_lr = [], []
+    pixart_readout_bridge, pixart_low_lr_params = [], []
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
         if any(k in n for k in ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]):
             pixart_readout_bridge.append(p)
         else:
-            pixart_low_lr.append(p)
+            pixart_low_lr_params.append(p)
 
     groups = []
     if pixart_readout_bridge:
         groups.append({"params": pixart_readout_bridge, "lr": float(pixart_readout_bridge_lr), "weight_decay": weight_decay, "name": "pixart_readout_bridge"})
-    if pixart_low_lr:
-        groups.append({"params": pixart_low_lr, "lr": float(pixart_low_lr), "weight_decay": weight_decay, "name": "pixart_low_lr"})
+    if pixart_low_lr_params:
+        groups.append({"params": pixart_low_lr_params, "lr": float(pixart_low_lr), "weight_decay": weight_decay, "name": "pixart_low_lr"})
 
     if not disable_adapter:
         memory_bridge, adapter_backbone = [], []
