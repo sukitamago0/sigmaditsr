@@ -30,15 +30,14 @@ from diffusion.model.gaussian_diffusion import GaussianDiffusion
 
 # ============================== Interpretation Guide ==============================
 # 1) Whole-image overfit:
-#    - If train loss decreases and full-image PSNR/SSIM rise while LPIPS drops,
-#      the model is fitting this sample globally.
+#    - Train loss ↓ and full-image PSNR/SSIM ↑ with LPIPS ↓ => model can memorize this sample globally.
 # 2) ROI overfit:
-#    - If ROI metrics improve significantly faster than full-image metrics,
-#      capacity is focusing on local detail restoration (expected for tiny ROI).
+#    - In ROI mode, dataset is already cropped to ROI patch; local ROI = full patch.
+#      So full metrics are ROI metrics. We still report both for readability.
 # 3) Adapter on/off comparison (--disable_adapter):
-#    - ON: conditioning path includes adapter tokens from paired lr_small patches.
-#    - OFF: conditioning path is disabled (adapter not used/trained).
-#    - If ON >> OFF in ROI/full metrics, gains are genuinely from adapter guidance.
+#    - ON: adapter tokens from paired lr_small participate in training/inference.
+#    - OFF: adapter path disabled and adapter params frozen.
+#    - If ON significantly outperforms OFF, gains come from adapter conditioning.
 # ===============================================================================
 
 
@@ -173,11 +172,15 @@ def center_crop_aligned_pair(lr_pil: Image.Image, hr_pil: Image.Image, scale: in
 
 
 class SingleRealSROverfitDataset(Dataset):
-    """Return fields exactly aligned with main training: hr/lr/lr_small/path."""
-    def __init__(self, roots, pick_index=0, roi=None):
+    """Return keys aligned to main training: hr/lr/lr_small/path."""
+
+    def __init__(self, roots, pick_index=0, roi=None, crop_size=512):
         self.norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
         self.to_tensor = transforms.ToTensor()
         self.pairs = []
+        self.roi = roi
+        self.crop_size = int(crop_size)
+
         for root in roots:
             if not os.path.isdir(root):
                 continue
@@ -185,13 +188,13 @@ class SingleRealSROverfitDataset(Dataset):
                 lr_path = hr_path.replace("_HR.png", "_LR4.png")
                 if os.path.exists(lr_path):
                     self.pairs.append((hr_path, lr_path))
+
         self.pairs = sorted(self.pairs)
         if len(self.pairs) == 0:
             raise FileNotFoundError(f"No RealSR pairs found in roots={roots}")
         if not (0 <= int(pick_index) < len(self.pairs)):
             raise IndexError(f"pick_index={pick_index} out of range [0,{len(self.pairs)-1}]")
         self.pick_index = int(pick_index)
-        self.roi = roi
 
     def __len__(self):
         return 1
@@ -205,8 +208,15 @@ class SingleRealSROverfitDataset(Dataset):
 
         hr_w, hr_h = hr_aligned.size
         if self.roi is None:
-            hr_crop = hr_aligned
-            lr_small_pil = lr_aligned
+            # whole-image mode still follows main-train-like fixed crop size distribution
+            c = int(self.crop_size)
+            if hr_h < c or hr_w < c:
+                # if sample is smaller than crop size, fallback to aligned full frame
+                hr_crop = hr_aligned
+                lr_small_pil = lr_aligned
+            else:
+                hr_crop = TF.center_crop(hr_aligned, (c, c))
+                lr_small_pil = TF.center_crop(lr_aligned, (c // 4, c // 4))
         else:
             x1, y1, x2, y2 = clamp_roi_to_hw(self.roi, hr_h, hr_w)
             hr_crop = TF.crop(hr_aligned, y1, x1, y2 - y1, x2 - x1)
@@ -219,13 +229,23 @@ class SingleRealSROverfitDataset(Dataset):
             ly2 = max(ly1 + 1, min(lr_h, ly2))
             lr_small_pil = TF.crop(lr_aligned, ly1, lx1, ly2 - ly1, lx2 - lx1)
 
-        hr_h, hr_w = hr_crop.size[1], hr_crop.size[0]
-        lr_up_pil = TF.resize(lr_small_pil, (hr_h, hr_w), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+        hr_h2, hr_w2 = hr_crop.size[1], hr_crop.size[0]
+        lr_up_pil = TF.resize(lr_small_pil, (hr_h2, hr_w2), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
 
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up_pil))
         lr_small_tensor = self.norm(self.to_tensor(lr_small_pil))
-        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
+
+        # In ROI mode, local-ROI for patch space is the whole patch.
+        local_roi = (0, 0, hr_w2, hr_h2) if self.roi is not None else None
+
+        return {
+            "hr": hr_tensor,
+            "lr": lr_tensor,
+            "lr_small": lr_small_tensor,
+            "path": hr_path,
+            "local_roi": local_roi,
+        }
 
 
 def randn_like_with_generator(tensor, generator):
@@ -253,8 +273,77 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     return out.expand(broadcast_shape)
 
 
+# ===== loss pieces aligned with train_sigma_sr_vpred_dualstream.py =====
+_SOBEL_X = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+_SOBEL_Y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+_LAPLACE = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32).view(1, 1, 3, 3)
+
+
+def _to_luma01(img_m11: torch.Tensor) -> torch.Tensor:
+    img01 = (img_m11.float() + 1.0) * 0.5
+    r = img01[:, 0:1]
+    g = img01[:, 1:2]
+    b = img01[:, 2:3]
+    return (0.2989 * r + 0.5870 * g + 0.1140 * b).clamp(0.0, 1.0)
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def edge_mask_from_gt(gt_m11: torch.Tensor, q: float = 0.90, pow_: float = 0.50, eps: float = 1e-6) -> torch.Tensor:
+    x = _to_luma01(gt_m11)
+    gx = F.conv2d(x, _SOBEL_X.to(x.device), padding=1)
+    gy = F.conv2d(x, _SOBEL_Y.to(x.device), padding=1)
+    mag = torch.sqrt(gx * gx + gy * gy + eps)
+    flat = mag.flatten(1)
+    denom = torch.quantile(flat, q, dim=1, keepdim=True).clamp_min(eps)
+    m = (flat / denom).view_as(mag).clamp(0.0, 1.0)
+    return m.pow(pow_) if pow_ != 1.0 else m
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def edge_guided_losses(pred_m11: torch.Tensor, gt_m11: torch.Tensor, q: float = 0.90, pow_: float = 0.50, eps: float = 1e-6):
+    m = edge_mask_from_gt(gt_m11, q=q, pow_=pow_, eps=eps)
+    p = _to_luma01(pred_m11)
+    g = _to_luma01(gt_m11)
+    pgx = F.conv2d(p, _SOBEL_X.to(p.device), padding=1)
+    pgy = F.conv2d(p, _SOBEL_Y.to(p.device), padding=1)
+    ggx = F.conv2d(g, _SOBEL_X.to(g.device), padding=1)
+    ggy = F.conv2d(g, _SOBEL_Y.to(g.device), padding=1)
+    loss_edge = (m * (pgx - ggx).abs() + m * (pgy - ggy).abs()).mean()
+    plap = F.conv2d(p, _LAPLACE.to(p.device), padding=1)
+    loss_flat_hf = ((1.0 - m) * plap.abs()).mean()
+    return loss_edge, loss_flat_hf, m
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> torch.Tensor:
+    pred_lr = F.interpolate(pred_m11.float(), size=lr_m11.shape[-2:], mode='bilinear', align_corners=False)
+    p = _to_luma01(pred_lr)
+    l = _to_luma01(lr_m11.float())
+    pgx = F.conv2d(p, _SOBEL_X.to(p.device), padding=1)
+    pgy = F.conv2d(p, _SOBEL_Y.to(p.device), padding=1)
+    lgx = F.conv2d(l, _SOBEL_X.to(l.device), padding=1)
+    lgy = F.conv2d(l, _SOBEL_Y.to(l.device), padding=1)
+    pl = F.conv2d(p, _LAPLACE.to(p.device), padding=1)
+    ll = F.conv2d(l, _LAPLACE.to(l.device), padding=1)
+    loss_sobel = (pgx - lgx).abs().mean() + (pgy - lgy).abs().mean()
+    loss_lap = (pl - ll).abs().mean()
+    p_low = F.avg_pool2d(p, kernel_size=5, stride=1, padding=2)
+    l_low = F.avg_pool2d(l, kernel_size=5, stride=1, padding=2)
+    loss_lowfreq = F.l1_loss(p_low, l_low)
+    return 0.4 * loss_sobel + 0.4 * loss_lap + 0.2 * loss_lowfreq
+
+
+def get_fixed_loss_weights():
+    return {
+        "latent_l1": 0.10,
+        "lr_cons": 0.05,
+        "edge_grad": 0.01,
+        "flat_hf": 0.00,
+    }
+
+
 @torch.no_grad()
-def run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_info, args, device, compute_dtype):
+def run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_info, args, device, compute_dtype, lpips_fn):
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
         beta_start=0.0001,
@@ -279,8 +368,7 @@ def run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_i
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
-        with torch.no_grad():
-            t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
+        t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = None
         if not args.disable_adapter:
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
@@ -290,7 +378,7 @@ def run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_i
             out = pixart(
                 x=latents.to(compute_dtype), timestep=t_b, y=y_embed,
                 aug_level=aug_level, mask=None, data_info=data_info,
-                adapter_cond=cond, force_drop_ids=torch.ones(latents.shape[0], device=device)
+                adapter_cond=cond, force_drop_ids=torch.ones(latents.shape[0], device=device),
             )
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
@@ -302,15 +390,11 @@ def run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_i
     hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
     m_psnr = float(psnr(py, hy, data_range=1.0).item())
     m_ssim = float(ssim(py, hy, data_range=1.0).item())
-
-    lpips_fn = lpips.LPIPS(net='vgg').to("cpu").eval()
-    for p in lpips_fn.parameters():
-        p.requires_grad_(False)
     m_lpips = float(lpips_fn(pred.detach().cpu().float(), hr.detach().cpu().float()).mean().item())
 
     roi_metrics = None
-    if args.roi is not None:
-        x1, y1, x2, y2 = args.roi
+    if args.local_roi is not None:
+        x1, y1, x2, y2 = args.local_roi
         pr_roi = pred01[..., y1:y2, x1:x2]
         hr_roi = hr01[..., y1:y2, x1:x2]
         pry = rgb01_to_y01(pr_roi)
@@ -324,33 +408,34 @@ def run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_i
     return pred, {"full": {"psnr": m_psnr, "ssim": m_ssim, "lpips": m_lpips}, "roi": roi_metrics}
 
 
-def save_visuals(out_dir, step, hr, lr, pred, roi):
+def save_visuals(out_dir, step, hr, lr, pred, local_roi):
     os.makedirs(out_dir, exist_ok=True)
     hr_np = (hr[0].detach().cpu().float().permute(1, 2, 0).numpy() + 1.0) * 0.5
     lr_np = (lr[0].detach().cpu().float().permute(1, 2, 0).numpy() + 1.0) * 0.5
     pr_np = (pred[0].detach().cpu().float().permute(1, 2, 0).numpy() + 1.0) * 0.5
 
     fig = plt.figure(figsize=(12, 4))
-    for i, (img, t) in enumerate([(lr_np, "LR(up)"), (hr_np, "HR GT"), (pr_np, "Pred")], start=1):
+    for i, (img, title) in enumerate([(lr_np, "LR(up)"), (hr_np, "HR GT"), (pr_np, "Pred")], start=1):
         ax = plt.subplot(1, 3, i)
         ax.imshow(np.clip(img, 0, 1))
-        ax.set_title(t)
+        ax.set_title(title)
         ax.axis("off")
     fig.savefig(os.path.join(out_dir, f"step_{step:06d}_full_triptych.png"), bbox_inches="tight")
     plt.close(fig)
 
-    if roi is not None:
-        x1, y1, x2, y2 = roi
-        hr_roi = hr_np[y1:y2, x1:x2]
+    if local_roi is not None:
+        x1, y1, x2, y2 = local_roi
+        lr_roi = lr_np[y1:y2, x1:x2]
         pr_roi = pr_np[y1:y2, x1:x2]
-        er = np.mean(np.abs(pr_roi - hr_roi), axis=2)
-        er = er / (er.max() + 1e-8)
+        hr_roi = hr_np[y1:y2, x1:x2]
+        err = np.mean(np.abs(pr_roi - hr_roi), axis=2)
+        err = err / (err.max() + 1e-8)
 
         fig = plt.figure(figsize=(14, 4))
-        ax1 = plt.subplot(1, 4, 1); ax1.imshow(np.clip(hr_roi, 0, 1)); ax1.set_title("ROI GT"); ax1.axis("off")
+        ax1 = plt.subplot(1, 4, 1); ax1.imshow(np.clip(lr_roi, 0, 1)); ax1.set_title("ROI LR(up)"); ax1.axis("off")
         ax2 = plt.subplot(1, 4, 2); ax2.imshow(np.clip(pr_roi, 0, 1)); ax2.set_title("ROI Pred"); ax2.axis("off")
-        ax3 = plt.subplot(1, 4, 3); ax3.imshow(np.clip(np.abs(pr_roi - hr_roi), 0, 1)); ax3.set_title("ROI |Err| RGB"); ax3.axis("off")
-        ax4 = plt.subplot(1, 4, 4); im = ax4.imshow(er, cmap="jet", vmin=0.0, vmax=1.0); ax4.set_title("ROI Error Heatmap"); ax4.axis("off")
+        ax3 = plt.subplot(1, 4, 3); ax3.imshow(np.clip(hr_roi, 0, 1)); ax3.set_title("ROI GT"); ax3.axis("off")
+        ax4 = plt.subplot(1, 4, 4); im = ax4.imshow(err, cmap="jet", vmin=0.0, vmax=1.0); ax4.set_title("ROI Error Heatmap"); ax4.axis("off")
         fig.colorbar(im, ax=ax4, fraction=0.046, pad=0.04)
         fig.savefig(os.path.join(out_dir, f"step_{step:06d}_roi_quad.png"), bbox_inches="tight")
         plt.close(fig)
@@ -372,6 +457,18 @@ def configure_trainable(pixart, adapter, disable_adapter=False):
             p.requires_grad_(True)
 
 
+def make_optimizer(pixart, adapter, disable_adapter=False, pixart_lr=1e-5, adapter_lr=3e-5):
+    pixart_params = [p for n, p in pixart.named_parameters() if p.requires_grad]
+    groups = [{"params": pixart_params, "lr": float(pixart_lr), "name": "pixart"}]
+
+    if not disable_adapter:
+        adapter_params = [p for _, p in adapter.named_parameters() if p.requires_grad]
+        if len(adapter_params) > 0:
+            groups.append({"params": adapter_params, "lr": float(adapter_lr), "name": "adapter"})
+
+    return torch.optim.AdamW(groups, weight_decay=0.0)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pixart_path", type=str, required=True)
@@ -381,17 +478,20 @@ def main():
     parser.add_argument("--realsr_roots", type=str, default="/data/RealSR/Nikon/Test/4,/data/RealSR/Canon/Test/4")
     parser.add_argument("--pick_index", type=int, default=0)
     parser.add_argument("--roi", type=str, default="")
+    parser.add_argument("--crop_size", type=int, default=512)
     parser.add_argument("--disable_adapter", action="store_true")
     parser.add_argument("--train_steps", type=int, default=400)
     parser.add_argument("--save_every", type=int, default=50)
     parser.add_argument("--infer_steps", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--pixart_lr", type=float, default=1e-5)
+    parser.add_argument("--adapter_lr", type=float, default=3e-5)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--lora_alpha", type=int, default=4)
-    parser.add_argument("--use_lq_init", action="store_true", default=True)
+    parser.add_argument("--use_lq_init", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lq_init_strength", type=float, default=0.5)
     parser.add_argument("--out_dir", type=str, default="outputs/overfit_single_realsr")
+    parser.add_argument("--tag", type=str, default="")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -400,16 +500,19 @@ def main():
 
     roi = parse_roi(args.roi)
     roots = [x.strip() for x in args.realsr_roots.split(",") if x.strip()]
-    ds = SingleRealSROverfitDataset(roots=roots, pick_index=args.pick_index, roi=roi)
+    ds = SingleRealSROverfitDataset(roots=roots, pick_index=args.pick_index, roi=roi, crop_size=args.crop_size)
     batch = ds[0]
 
     hr = batch["hr"].unsqueeze(0).to(device)
     lr = batch["lr"].unsqueeze(0).to(device)
     lr_small = batch["lr_small"].unsqueeze(0).to(device)
 
-    h, w = hr.shape[-2:]
-    roi = clamp_roi_to_hw(roi, h, w) if roi is not None else None
-    args.roi = roi
+    # ROI mode bug fix: once sample is cropped to ROI patch, use local patch ROI only.
+    if batch["local_roi"] is not None:
+        args.local_roi = batch["local_roi"]
+    else:
+        h, w = hr.shape[-2:]
+        args.local_roi = clamp_roi_to_hw(roi, h, w) if roi is not None else None
 
     pixart = PixArtSigmaSR_XL_2(input_size=64, in_channels=4, out_channels=4).to(device)
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -442,28 +545,40 @@ def main():
     vae.enable_slicing()
     null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
     y_embed = null_pack["y"].to(device)
+    h, w = hr.shape[-2:]
     data_info = {
         "img_hw": torch.tensor([[float(h), float(w)]], device=device),
         "aspect_ratio": torch.tensor([float(w) / float(h)], device=device),
     }
 
-    # disable EMA / dropout / cond noise: this script never applies them.
+    lpips_fn = lpips.LPIPS(net='vgg').to("cpu").eval()
+    for p in lpips_fn.parameters():
+        p.requires_grad_(False)
+
+    # Disable EMA/condition dropout/condition noise/augmentation sampling by design.
     configure_trainable(pixart, adapter, disable_adapter=args.disable_adapter)
-    params = [p for p in list(pixart.parameters()) + list(adapter.parameters()) if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
+    optimizer = make_optimizer(
+        pixart,
+        adapter,
+        disable_adapter=args.disable_adapter,
+        pixart_lr=args.pixart_lr,
+        adapter_lr=args.adapter_lr,
+    )
 
     diffusion = GaussianDiffusion(timestep_respacing="")
     pixart.train()
     adapter.train()
 
+    out_dir = args.out_dir if args.tag == "" else os.path.join(args.out_dir, args.tag)
+
     print(f"[Overfit] sample={batch['path']} hr={tuple(hr.shape)} lr={tuple(lr.shape)} lr_small={tuple(lr_small.shape)} disable_adapter={args.disable_adapter}")
-    if roi is not None:
-        print(f"[Overfit] ROI={roi} (x1,y1,x2,y2)")
+    if args.local_roi is not None:
+        print(f"[Overfit] local ROI={args.local_roi} (x1,y1,x2,y2)")
+    print(f"[Overfit] optimizer lrs: pixart_lr={args.pixart_lr}, adapter_lr={args.adapter_lr}")
 
     for step in range(1, args.train_steps + 1):
         with torch.no_grad():
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
-            z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
         t = torch.randint(0, 1000, (z_hr.shape[0],), device=device).long()
         noise = torch.randn_like(z_hr)
@@ -479,36 +594,73 @@ def main():
 
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             out = pixart(
-                x=zt.to(compute_dtype), timestep=t, y=y_embed,
+                x=zt.to(compute_dtype),
+                timestep=t,
+                y=y_embed,
                 aug_level=torch.zeros((zt.shape[0],), device=device, dtype=compute_dtype),
-                mask=None, data_info=data_info, adapter_cond=cond,
+                mask=None,
+                data_info=data_info,
+                adapter_cond=cond,
                 force_drop_ids=torch.ones(zt.shape[0], device=device),
             )
             model_pred = out.float()
+
             alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, z_hr.shape)
             sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, z_hr.shape)
             target_v = alpha_t * noise - sigma_t * z_hr.float()
             loss_v = F.mse_loss(model_pred, target_v)
+
             z0 = alpha_t * zt.float() - sigma_t * model_pred
             loss_latent_l1 = F.l1_loss(z0, z_hr.float())
-            loss = loss_v + 0.25 * loss_latent_l1
+
+            pred = vae.decode(z0 / vae.config.scaling_factor).sample.clamp(-1, 1)
+            loss_lr_cons = structure_consistency_loss(pred, lr)
+            loss_edge, _, _ = edge_guided_losses(pred, hr)
+
+            wloss = get_fixed_loss_weights()
+            loss = loss_v + wloss["latent_l1"] * loss_latent_l1 + wloss["lr_cons"] * loss_lr_cons + wloss["edge_grad"] * loss_edge
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
         if step % 10 == 0 or step == 1:
-            print(f"[Step {step:04d}] loss={float(loss.item()):.6f} v={float(loss_v.item()):.6f} z_l1={float(loss_latent_l1.item()):.6f}")
+            print(
+                f"[Step {step:04d}] loss={float(loss.item()):.6f} "
+                f"v={float(loss_v.item()):.6f} z_l1={float(loss_latent_l1.item()):.6f} "
+                f"lr_cons={float(loss_lr_cons.item()):.6f} edge={float(loss_edge.item()):.6f}"
+            )
 
         if (step % args.save_every == 0) or (step == args.train_steps):
-            pixart.eval(); adapter.eval()
+            pixart.eval()
+            adapter.eval()
             with torch.no_grad():
-                pred, metrics = run_formal_inference(pixart, adapter, vae, hr, lr, lr_small, y_embed, data_info, args, device, compute_dtype)
-            print(f"[Eval step {step}] full: PSNR={metrics['full']['psnr']:.4f}, SSIM={metrics['full']['ssim']:.4f}, LPIPS={metrics['full']['lpips']:.4f}")
+                pred_eval, metrics = run_formal_inference(
+                    pixart, adapter, vae, hr, lr, lr_small, y_embed, data_info, args, device, compute_dtype, lpips_fn
+                )
+
+            route_w = getattr(pixart, "_last_route_weights", None)
+            if torch.is_tensor(route_w):
+                rE = float(route_w[:, 0].mean().item())
+                rM = float(route_w[:, 1].mean().item())
+                rL = float(route_w[:, 2].mean().item())
+            else:
+                rE = rM = rL = 0.0
+
+            print(
+                f"[Eval step {step}] full: PSNR={metrics['full']['psnr']:.4f}, "
+                f"SSIM={metrics['full']['ssim']:.4f}, LPIPS={metrics['full']['lpips']:.4f} | "
+                f"route(rE/rM/rL)=({rE:.3f}/{rM:.3f}/{rL:.3f})"
+            )
             if metrics["roi"] is not None:
-                print(f"[Eval step {step}] roi : PSNR={metrics['roi']['psnr']:.4f}, SSIM={metrics['roi']['ssim']:.4f}, LPIPS={metrics['roi']['lpips']:.4f}")
-            save_visuals(args.out_dir, step, hr, lr, pred, roi)
-            pixart.train(); adapter.train()
+                print(
+                    f"[Eval step {step}] roi : PSNR={metrics['roi']['psnr']:.4f}, "
+                    f"SSIM={metrics['roi']['ssim']:.4f}, LPIPS={metrics['roi']['lpips']:.4f}"
+                )
+
+            save_visuals(out_dir, step, hr, lr, pred_eval, args.local_roi)
+            pixart.train()
+            adapter.train()
 
 
 if __name__ == "__main__":
