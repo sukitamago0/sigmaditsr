@@ -72,10 +72,8 @@ MAX_TRAIN_STEPS = int(os.getenv("MAX_TRAIN_STEPS", "20000"))
 GRAD_ACCUM_STEPS = int(os.getenv("GRAD_ACCUM_STEPS", "16"))
 SAVE_EVERY = int(os.getenv("SAVE_EVERY", "1000"))
 VAL_EVERY = int(os.getenv("VAL_EVERY", "1000"))
-FAST_VAL_BATCHES = int(os.getenv("FAST_VAL_BATCHES", "2"))
-FAST_VAL_STEPS = int(os.getenv("FAST_VAL_STEPS", "10"))
-VAL_STEPS = int(os.getenv("VAL_STEPS", "50"))
-USE_FAST_VAL = bool(int(os.getenv("USE_FAST_VAL", "0")))
+VAL_STEPS_LIST = [50]
+BEST_VAL_STEPS = 50
 
 T_SAMPLE_MODE = os.getenv("T_SAMPLE_MODE", "power")
 T_SAMPLE_POWER = float(os.getenv("T_SAMPLE_POWER", "2.5"))
@@ -92,7 +90,9 @@ SCALE = int(os.getenv("SCALE", str(DEFAULT_DATA_CONFIG["scale"])))
 TRAIN_DF2K_HR_DIR = os.getenv("TRAIN_DF2K_HR_DIR", DEFAULT_DATA_CONFIG["train_df2k_hr_dir"])
 TRAIN_DF2K_LR_DIR = os.getenv("TRAIN_DF2K_LR_DIR", DEFAULT_DATA_CONFIG["train_df2k_lr_dir"])
 TRAIN_REALSR_ROOTS = [x.strip() for x in os.getenv("TRAIN_REALSR_ROOTS", ",".join(DEFAULT_DATA_CONFIG["train_realsr_roots"])).split(",") if x.strip()]
-VAL_REALSR_ROOTS = [x.strip() for x in os.getenv("VAL_REALSR_ROOTS", ",".join(DEFAULT_DATA_CONFIG["val_realsr_roots"])).split(",") if x.strip()]
+VAL_REALSR_ROOTS = [
+    x.strip() for x in os.getenv("VAL_REALSR_ROOTS", "/data/RealSR/Nikon/Test/4,/data/RealSR/Canon/Test/4").split(",") if x.strip()
+]
 
 PRETRAINED_ROOT = os.getenv("DTSR_PRETRAINED_ROOT", "/home/hello/HJT/PixArt-sigma/output/pretrained_models")
 PIXART_PATH = os.path.join(PRETRAINED_ROOT, "PixArt-Sigma-XL-2-512-MS.pth")
@@ -141,15 +141,15 @@ def save_preview_image(step: int, pred: torch.Tensor):
     print(f"[preview] saved {out}")
 
 
-def should_keep_ckpt(curr, best):
-    # PSNR first, LPIPS tiebreak
+def should_keep_ckpt(psnr_v: float, lpips_v: float, best):
+    # PSNR first, LPIPS tiebreak (legacy rule)
     if best is None:
         return True
-    c_psnr, _, c_lpips = curr
-    b_psnr, _, b_lpips = best
-    if c_psnr > b_psnr + 1e-9:
+    b_psnr = float(best["psnr"])
+    b_lpips = float(best["lpips"])
+    if float(psnr_v) > b_psnr + 1e-9:
         return True
-    if abs(c_psnr - b_psnr) <= 1e-9 and c_lpips < b_lpips:
+    if abs(float(psnr_v) - b_psnr) <= 1e-9 and float(lpips_v) < b_lpips:
         return True
     return False
 
@@ -159,76 +159,74 @@ def validate(step, pixart, adapter, vae, val_loader, y_embed, lpips_fn_cpu):
     pixart.eval()
     adapter.eval()
 
-    steps = FAST_VAL_STEPS if USE_FAST_VAL else VAL_STEPS
-    max_batches = FAST_VAL_BATCHES if USE_FAST_VAL else None
-
-    scheduler = DDIMScheduler(
-        num_train_timesteps=1000,
-        beta_start=0.0001,
-        beta_end=0.02,
-        beta_schedule="linear",
-        clip_sample=False,
-        prediction_type="v_prediction",
-        set_alpha_to_one=False,
-    )
-    scheduler.set_timesteps(steps, device=DEVICE)
-    gen = torch.Generator(device=DEVICE)
-    gen.manual_seed(SEED + int(step))
-
     data_info = {
         "img_hw": torch.tensor([[float(CROP_SIZE), float(CROP_SIZE)]], device=DEVICE),
         "aspect_ratio": torch.tensor([1.0], device=DEVICE),
     }
 
-    psnrs, ssims, lpipss = [], [], []
-    preview_pred = None
-    for bi, batch in enumerate(val_loader):
-        if (max_batches is not None) and (bi >= max_batches):
-            break
-        hr = batch["hr"].to(DEVICE)
-        lr = batch["lr"].to(DEVICE)
-        lr_small = batch["lr_small"].to(DEVICE)
+    all_res = {}
+    for steps in VAL_STEPS_LIST:
+        scheduler = DDIMScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="linear",
+            clip_sample=False,
+            prediction_type="v_prediction",
+            set_alpha_to_one=False,
+        )
+        scheduler.set_timesteps(int(steps), device=DEVICE)
+        gen = torch.Generator(device=DEVICE)
+        gen.manual_seed(SEED + int(step) + int(steps))
 
-        z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
-        latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, gen, 0.3, COMPUTE_DTYPE)
+        psnrs, ssims, lpipss = [], [], []
+        preview_pred = None
+        for batch in tqdm(val_loader, desc=f"Val@{steps}", leave=False):
+            hr = batch["hr"].to(DEVICE)
+            lr = batch["lr"].to(DEVICE)
+            lr_small = batch["lr_small"].to(DEVICE)
 
-        aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
-        for t in run_timesteps:
-            t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
-            t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
-            cond = adapter(lr_small.to(dtype=COMPUTE_DTYPE), t_embed=t_embed)
-            out = pixart(
-                x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
-                aug_level=aug_level, mask=None, data_info=data_info,
-                adapter_cond=cond, force_drop_ids=torch.ones(latents.shape[0], device=DEVICE)
-            )
-            latents = scheduler.step(out.float(), t, latents.float()).prev_sample
+            z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
+            latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, int(steps), gen, 0.3, COMPUTE_DTYPE)
 
-        pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
-        if preview_pred is None:
-            preview_pred = pred
+            aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
+            for t in run_timesteps:
+                t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
+                t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
+                cond = adapter(lr_small.to(dtype=COMPUTE_DTYPE), t_embed=t_embed)
+                out = pixart(
+                    x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
+                    aug_level=aug_level, mask=None, data_info=data_info,
+                    adapter_cond=cond, force_drop_ids=torch.ones(latents.shape[0], device=DEVICE)
+                )
+                latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-        pred01 = (pred + 1.0) / 2.0
-        hr01 = (hr + 1.0) / 2.0
-        py = rgb01_to_y01(pred01)[..., 4:-4, 4:-4]
-        hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
+            pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
+            if preview_pred is None:
+                preview_pred = pred
 
-        psnrs.append(float(psnr(py, hy, data_range=1.0).item()))
-        ssims.append(float(ssim(py, hy, data_range=1.0).item()))
-        lpipss.append(float(lpips_fn_cpu(pred.detach().cpu().float(), hr.detach().cpu().float()).mean().item()))
+            pred01 = (pred + 1.0) / 2.0
+            hr01 = (hr + 1.0) / 2.0
+            py = rgb01_to_y01(pred01)[..., 4:-4, 4:-4]
+            hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
+
+            psnrs.append(float(psnr(py, hy, data_range=1.0).item()))
+            ssims.append(float(ssim(py, hy, data_range=1.0).item()))
+            lpipss.append(float(lpips_fn_cpu(pred.detach().cpu().float(), hr.detach().cpu().float()).mean().item()))
+
+        if preview_pred is not None and int(steps) == int(BEST_VAL_STEPS):
+            save_preview_image(step, preview_pred)
+
+        all_res[int(steps)] = {
+            "psnr": float(np.mean(psnrs)) if psnrs else 0.0,
+            "ssim": float(np.mean(ssims)) if ssims else 0.0,
+            "lpips": float(np.mean(lpipss)) if lpipss else 1e9,
+        }
+        print(f"[VAL@{steps}] step={step} PSNR={all_res[int(steps)]['psnr']:.4f} SSIM={all_res[int(steps)]['ssim']:.6f} LPIPS={all_res[int(steps)]['lpips']:.6f}")
 
     pixart.train()
     adapter.train()
-    if preview_pred is not None:
-        save_preview_image(step, preview_pred)
-
-    res = {
-        "psnr": float(np.mean(psnrs)) if psnrs else 0.0,
-        "ssim": float(np.mean(ssims)) if ssims else 0.0,
-        "lpips": float(np.mean(lpipss)) if lpipss else 1e9,
-    }
-    print(f"[VAL@{steps}] step={step} PSNR={res['psnr']:.4f} SSIM={res['ssim']:.6f} LPIPS={res['lpips']:.6f}")
-    return res
+    return all_res
 
 
 def save_ckpt(path, step, pixart, adapter, optimizer, best_metrics, msm_qca_config):
@@ -461,13 +459,12 @@ def main():
                     save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_metrics, msm_qca_config)
 
                 if step % VAL_EVERY == 0:
-                    m = validate(step, pixart, adapter, vae, val_loader, y, lpips_fn_val_cpu)
-                    curr = (m["psnr"], m["ssim"], m["lpips"])
-                    best_triplet = None if best_metrics is None else (float(best_metrics["psnr"]), float(best_metrics["ssim"]), float(best_metrics["lpips"]))
-                    if should_keep_ckpt(curr, best_triplet):
-                        best_metrics = dict(m)
+                    val_res = validate(step, pixart, adapter, vae, val_loader, y, lpips_fn_val_cpu)
+                    best_view = val_res[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_res else next(iter(val_res.values()))
+                    if should_keep_ckpt(best_view["psnr"], best_view["lpips"], best_metrics):
+                        best_metrics = dict(best_view)
                         save_ckpt(BEST_CKPT_PATH, step, pixart, adapter, optimizer, best_metrics, msm_qca_config)
-                        print(f"[best] updated {BEST_CKPT_PATH} with PSNR={m['psnr']:.4f} SSIM={m['ssim']:.6f} LPIPS={m['lpips']:.6f}")
+                        print(f"[best@{BEST_VAL_STEPS}] updated {BEST_CKPT_PATH} with PSNR={best_view['psnr']:.4f} SSIM={best_view['ssim']:.6f} LPIPS={best_view['lpips']:.6f}")
                     save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_metrics, msm_qca_config)
 
                 if step >= MAX_TRAIN_STEPS:
