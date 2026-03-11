@@ -3,7 +3,7 @@
 
 To avoid accidental legacy usage, use these scripts as the current MSM-QCA mainline:
 
-- **Main training**: `train_scripts/train_sigma_sr_msm_qca.py`
+- **Main training**: `train_scripts/train_sigma_sr_vpred_dualstream.py`
 - **Main inference**: `train_scripts/infer_sr_single_ddim100_msm_qca.py`
 - **Main evaluation**: `train_scripts/eval_sr_baseline_vs_model.py`
 
