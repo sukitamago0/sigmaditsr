@@ -88,6 +88,7 @@ class SRConvNetMSMQCAAdapter(nn.Module):
         nn.init.zeros_(self.memory_out_proj.bias)
 
         self._shape_logged = False
+        self._pos_cache = {}
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -95,8 +96,12 @@ class SRConvNetMSMQCAAdapter(nn.Module):
 
     def _build_2d_sincos_tokens(self, feat: torch.Tensor) -> torch.Tensor:
         b, _, h, w = feat.shape
-        pos = get_2d_sincos_pos_embed(512, (h, w))  # [h*w, 512]
-        pos = torch.from_numpy(pos).to(device=feat.device, dtype=feat.dtype)
+        key = (int(h), int(w))
+        if key not in self._pos_cache:
+            pos = get_2d_sincos_pos_embed(512, (h, w))  # [h*w, 512]
+            self._pos_cache[key] = torch.from_numpy(pos).float()
+        pos_cpu = self._pos_cache[key]
+        pos = pos_cpu.to(device=feat.device, dtype=feat.dtype)
         pos = pos.unsqueeze(0).expand(b, -1, -1)
         return pos
 
@@ -155,7 +160,6 @@ class SRConvNetMSMQCAAdapter(nn.Module):
         }
 
 
-def build_adapter_msm_qca(in_channels=3, hidden_size=1152, injection_layers_map=None):
-    del in_channels, injection_layers_map
+def build_adapter_msm_qca(hidden_size=1152):
     return SRConvNetMSMQCAAdapter(hidden_size=hidden_size)
 

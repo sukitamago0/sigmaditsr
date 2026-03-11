@@ -27,6 +27,7 @@ from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_msm_qca
 from diffusion import IDDPM
 
+ADAPTER_CA_BLOCK_IDS = [14, 18, 22, 26]
 
 # ============================== Interpretation Guide ==============================
 # 1) Whole-image overfit:
@@ -541,7 +542,7 @@ def main():
         h, w = hr.shape[-2:]
         args.local_roi = clamp_roi_to_hw(roi, h, w) if roi is not None else None
 
-    pixart = PixArtSigmaSR_XL_2(input_size=64, in_channels=4, out_channels=4).to(device)
+    pixart = PixArtSigmaSR_XL_2(input_size=64, in_channels=4, out_channels=4, adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS).to(device)
     base = torch.load(args.pixart_path, map_location="cpu")
     if "state_dict" in base:
         base = base["state_dict"]
@@ -552,7 +553,7 @@ def main():
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
-    adapter = build_adapter_msm_qca(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(device).float()
+    adapter = build_adapter_msm_qca(hidden_size=1152).to(device).float()
 
     print(f"[Overfit] init_mode={args.init_mode}")
     if args.init_mode == "warm":
@@ -567,7 +568,9 @@ def main():
         apply_lora_attn_only(pixart, rank=lora_rank if has_lora else int(args.lora_rank), alpha=lora_alpha if has_lora else int(args.lora_alpha))
         _load_pixart_subset_compatible(pixart, saved_trainable, context="overfit")
         if "adapter" in ckpt:
-            load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="overfit-adapter")
+            miss, unexp = adapter.load_state_dict(ckpt["adapter"], strict=True)
+            print(f"[overfit-adapter] strict load ok: missing={len(miss)}, unexpected={len(unexp)}")
+
     elif args.init_mode == "cold":
         # Cold-start: same architecture, random LoRA/bridge/adapters, no warm weights from best checkpoint.
         apply_lora_attn_only(pixart, rank=int(args.lora_rank), alpha=int(args.lora_alpha))

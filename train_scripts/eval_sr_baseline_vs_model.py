@@ -26,6 +26,7 @@ from diffusion.model.nets.adapter import build_adapter_msm_qca
 
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+ADAPTER_CA_BLOCK_IDS = [14, 18, 22, 26]
 
 
 def file_sha256(path):
@@ -268,7 +269,7 @@ def evaluate(args):
 
     pixart, adapter, vae, y_embed, d_info, scheduler, val_gen = [None] * 7
     if run_model:
-        pixart = PixArtSigmaSR_XL_2(input_size=64, in_channels=4, out_channels=4).to(device)
+        pixart = PixArtSigmaSR_XL_2(input_size=64, in_channels=4, out_channels=4, adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS).to(device)
         load_sigma_sr_base_weights(pixart, args.pixart_path)
 
         ckpt = torch.load(args.ckpt_path, map_location="cpu")
@@ -281,8 +282,9 @@ def evaluate(args):
 
         _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="eval")
 
-        adapter = build_adapter_msm_qca(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(device).float()
-        load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="eval-adapter")
+        adapter = build_adapter_msm_qca(hidden_size=1152).to(device).float()
+        miss, unexp = adapter.load_state_dict(ckpt["adapter"], strict=True)
+        print(f"[eval-adapter] strict load ok: missing={len(miss)}, unexpected={len(unexp)}")
 
         pixart.eval()
         adapter.eval()

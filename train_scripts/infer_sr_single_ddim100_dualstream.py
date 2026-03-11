@@ -1,3 +1,4 @@
+# LEGACY / NOT FOR CURRENT MSM-QCA MAINLINE
 import os
 import sys
 import math
@@ -18,6 +19,7 @@ from diffusers import AutoencoderKL, DDIMScheduler
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_msm_qca
 
+ADAPTER_CA_BLOCK_IDS = [14, 18, 22, 26]
 
 def randn_like_with_generator(tensor, generator):
     return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
@@ -176,7 +178,7 @@ def run(args):
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
-        in_channels=3,
+        in_channels=4,
         out_channels=4,
         sparse_inject_ratio=1.0,
         
@@ -191,6 +193,7 @@ def run(args):
         dualstream_enabled=False,
         cross_attn_start_layer=16,
         dual_num_heads=16,
+        adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -205,11 +208,7 @@ def run(args):
     else:
         load_state_dict_shape_compatible(pixart, base, context="infer-base-pretrain")
 
-    adapter = build_adapter_msm_qca(
-        in_channels=3,
-        hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
-    ).to(device).float()
+    adapter = build_adapter_msm_qca(hidden_size=1152).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
 
@@ -226,7 +225,10 @@ def run(args):
         apply_lora(pixart, rank=ckpt_lora_rank, alpha=ckpt_lora_alpha)
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
-    load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="infer-adapter")
+    
+    miss, unexp = adapter.load_state_dict(ckpt["adapter"], strict=True)
+    print(f"[infer-adapter] strict load ok: missing={len(miss)}, unexpected={len(unexp)}")
+
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
