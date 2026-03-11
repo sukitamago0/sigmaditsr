@@ -234,12 +234,13 @@ def validate(step, pixart, adapter, vae, val_loader, y_embed, lpips_fn_cpu):
     return all_res
 
 
-def save_ckpt(path, step, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen):
+def save_ckpt(path, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen):
     cuda_rng_state_all = None
     if torch.cuda.is_available():
         cuda_rng_state_all = [x.cpu() for x in torch.cuda.get_rng_state_all()]
     sd = {
         "step": int(step),
+        "epoch": int(epoch),
         "pixart_keep": {k: v.detach().cpu().float() for k, v in pixart.state_dict().items()},
         "adapter": {k: v.detach().cpu().float() for k, v in adapter.state_dict().items()},
         "optimizer": optimizer.state_dict(),
@@ -259,7 +260,7 @@ def save_ckpt(path, step, pixart, adapter, optimizer, best_metrics, msm_qca_conf
 def resume_if_possible(pixart, adapter, optimizer, msm_qca_config, dl_gen):
     if not os.path.isfile(LAST_CKPT_PATH):
         print("[resume] no last checkpoint, train from scratch")
-        return 0, None
+        return 0, 0, None
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
     assert_msm_qca_config_compatible(msm_qca_config, ckpt.get("msm_qca_config", {}), context="train-resume")
     load_pixart_subset_compatible(pixart, ckpt.get("pixart_keep", {}), context="train-resume")
@@ -279,9 +280,10 @@ def resume_if_possible(pixart, adapter, optimizer, msm_qca_config, dl_gen):
         dl_gen.set_state(ckpt["dl_gen_state"])
 
     step = int(ckpt.get("step", 0))
+    epoch = int(ckpt.get("epoch", 0))
     best_metrics = ckpt.get("best_eval_metrics", None)
-    print(f"[resume] restored from {LAST_CKPT_PATH} @ step={step}")
-    return step, best_metrics
+    print(f"[resume] restored from {LAST_CKPT_PATH} @ step={step} epoch={epoch}")
+    return step, epoch, best_metrics
 
 
 def main():
@@ -388,12 +390,11 @@ def main():
     print(f"[MSM-QCA mainline] out_dir={OUT_DIR}")
     print(f"[MSM-QCA mainline] adapter_ca_block_ids={ADAPTER_CA_BLOCK_IDS}")
 
-    step, best_metrics = resume_if_possible(pixart, adapter, optimizer, msm_qca_config, dl_gen)
+    step, epoch, best_metrics = resume_if_possible(pixart, adapter, optimizer, msm_qca_config, dl_gen)
 
     accum_micro_steps = 0
     optimizer.zero_grad()
     pbar = tqdm(total=MAX_TRAIN_STEPS, desc="train_msm_qca", initial=step)
-    epoch = 0
     params_to_clip = [p for p in list(pixart.parameters()) + list(adapter.parameters()) if p.requires_grad]
 
     while step < MAX_TRAIN_STEPS:
@@ -494,16 +495,16 @@ def main():
                     print(f"[step={step}] loss={float(loss.item()):.4f} v={float(loss_v.item()):.4f} ca_gate_mean={ca_m:.4f}")
 
                 if step % SAVE_EVERY == 0:
-                    save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
+                    save_ckpt(LAST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
 
                 if step % VAL_EVERY == 0:
                     val_res = validate(step, pixart, adapter, vae, val_loader, y, lpips_fn_val_cpu)
                     best_view = val_res[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_res else next(iter(val_res.values()))
                     if should_keep_ckpt(best_view["psnr"], best_view["lpips"], best_metrics):
                         best_metrics = dict(best_view)
-                        save_ckpt(BEST_CKPT_PATH, step, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
+                        save_ckpt(BEST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
                         print(f"[best@{BEST_VAL_STEPS}] updated {BEST_CKPT_PATH} with PSNR={best_view['psnr']:.4f} SSIM={best_view['ssim']:.6f} LPIPS={best_view['lpips']:.6f}")
-                    save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
+                    save_ckpt(LAST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
 
                 if step >= MAX_TRAIN_STEPS:
                     break
@@ -519,7 +520,7 @@ def main():
 
         epoch += 1
 
-    save_ckpt(LAST_CKPT_PATH, step, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
+    save_ckpt(LAST_CKPT_PATH, step, epoch, pixart, adapter, optimizer, best_metrics, msm_qca_config, dl_gen)
     pbar.close()
     print("✅ MSM-QCA training finished")
 
