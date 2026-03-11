@@ -461,13 +461,35 @@ def configure_trainable(pixart, adapter, disable_adapter=False, bridge_only_debu
 
 
 def make_optimizer(pixart, adapter, disable_adapter=False, pixart_lr=1e-5, adapter_lr=3e-5):
-    pixart_params = [p for n, p in pixart.named_parameters() if p.requires_grad]
-    groups = [{"params": pixart_params, "lr": float(pixart_lr), "name": "pixart"}]
+    # align semantics with main training: memory_bridge / adapter_backbone / pixart_readout_bridge / pixart_low_lr
+    pixart_readout_bridge, pixart_low_lr = [], []
+    for n, p in pixart.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(k in n for k in ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]):
+            pixart_readout_bridge.append(p)
+        else:
+            pixart_low_lr.append(p)
+
+    groups = []
+    if len(pixart_readout_bridge) > 0:
+        groups.append({"params": pixart_readout_bridge, "lr": max(5e-5, float(pixart_lr)), "name": "pixart_readout_bridge"})
+    if len(pixart_low_lr) > 0:
+        groups.append({"params": pixart_low_lr, "lr": min(5e-6, float(pixart_lr)), "name": "pixart_low_lr"})
 
     if not disable_adapter:
-        adapter_params = [p for _, p in adapter.named_parameters() if p.requires_grad]
-        if len(adapter_params) > 0:
-            groups.append({"params": adapter_params, "lr": float(adapter_lr), "name": "adapter"})
+        memory_bridge, adapter_backbone = [], []
+        for n, p in adapter.named_parameters():
+            if not p.requires_grad:
+                continue
+            if any(k in n for k in ["mem_proj_", "resampler", "memory_out_proj", "memory_ln", "scale_embed", "q2", "q3", "q4"]):
+                memory_bridge.append(p)
+            else:
+                adapter_backbone.append(p)
+        if len(memory_bridge) > 0:
+            groups.append({"params": memory_bridge, "lr": max(1e-4, float(adapter_lr)), "name": "memory_bridge"})
+        if len(adapter_backbone) > 0:
+            groups.append({"params": adapter_backbone, "lr": float(adapter_lr), "name": "adapter_backbone"})
 
     return torch.optim.AdamW(groups, weight_decay=0.0)
 
@@ -494,7 +516,7 @@ def main():
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--lora_alpha", type=int, default=4)
     parser.add_argument("--use_lq_init", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--lq_init_strength", type=float, default=0.5)
+    parser.add_argument("--lq_init_strength", type=float, default=0.3)
     parser.add_argument("--out_dir", type=str, default="outputs/overfit_single_realsr")
     parser.add_argument("--tag", type=str, default="")
     args = parser.parse_args()

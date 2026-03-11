@@ -1,3 +1,4 @@
+# LEGACY / NOT FOR CURRENT MSM-QCA MAINLINE
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

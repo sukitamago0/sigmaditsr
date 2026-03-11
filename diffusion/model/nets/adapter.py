@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from diffusion.model.nets.srconvnet_blocks import SRConvNetBlock
+from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
 class PerScaleResamplerBlock(nn.Module):
@@ -94,17 +95,9 @@ class SRConvNetMSMQCAAdapter(nn.Module):
 
     def _build_2d_sincos_tokens(self, feat: torch.Tensor) -> torch.Tensor:
         b, _, h, w = feat.shape
-        yy, xx = torch.meshgrid(
-            torch.linspace(-1.0, 1.0, h, device=feat.device, dtype=feat.dtype),
-            torch.linspace(-1.0, 1.0, w, device=feat.device, dtype=feat.dtype),
-            indexing="ij",
-        )
-        # 4-d sin/cos basis
-        pos = torch.stack([torch.sin(math.pi * xx), torch.cos(math.pi * xx), torch.sin(math.pi * yy), torch.cos(math.pi * yy)], dim=0)
-        pos = pos.view(1, 4, h * w).permute(0, 2, 1).repeat(b, 1, 1)
-        # expand to 512 by tiled repeat + trim
-        rep = (512 + 3) // 4
-        pos = pos.repeat(1, 1, rep)[..., :512]
+        pos = get_2d_sincos_pos_embed(512, (h, w))  # [h*w, 512]
+        pos = torch.from_numpy(pos).to(device=feat.device, dtype=feat.dtype)
+        pos = pos.unsqueeze(0).expand(b, -1, -1)
         return pos
 
     def _tokenize_with_pos_scale(self, feat: torch.Tensor, scale_id: int) -> torch.Tensor:
@@ -166,12 +159,3 @@ def build_adapter_msm_qca(in_channels=3, hidden_size=1152, injection_layers_map=
     del in_channels, injection_layers_map
     return SRConvNetMSMQCAAdapter(hidden_size=hidden_size)
 
-
-# compatibility aliases
-
-def build_adapter_v8(in_channels=3, hidden_size=1152, injection_layers_map=None):
-    return build_adapter_msm_qca(in_channels=in_channels, hidden_size=hidden_size, injection_layers_map=injection_layers_map)
-
-
-def build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=None):
-    return build_adapter_msm_qca(in_channels=in_channels, hidden_size=hidden_size, injection_layers_map=injection_layers_map)

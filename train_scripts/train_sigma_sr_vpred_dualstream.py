@@ -1,3 +1,4 @@
+# LEGACY / NOT FOR CURRENT MSM-QCA MAINLINE
 # /home/hello/HJT/DiTSR/experiments/train_4090_auto_v8.py
 # DiTSR v8 Training Script (Final Corrected Version)
 # ------------------------------------------------------------------
@@ -121,6 +122,7 @@ NUM_WORKERS = 8
 LR_BASE = 1e-5 
 LORA_RANK = 4
 LORA_ALPHA = 4
+ADAPTER_CA_BLOCK_IDS = [14, 18, 22, 26]
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -1390,12 +1392,16 @@ def save_smart(
             "best_eval_steps": int(eval_steps),
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
             "best_eval_tag": str(eval_tag),
-            "injection_config": {
-                "injection_strategy": str(INJECTION_STRATEGY),
-                "injection_cutoff_layer": int(INJECTION_CUTOFF_LAYER),
-                "hard_layers": list(HARD_INJECTION_LAYERS),
-                "transition_layers": list(TRANSITION_INJECTION_LAYERS),
-                "detail_layers": list(DETAIL_INJECTION_LAYERS),
+            "msm_qca_config": {
+                "adapter_type": "msm_qca",
+                "adapter_ca_block_ids": list(ADAPTER_CA_BLOCK_IDS),
+                "memory_token_counts": {"n2": 64, "n3": 32, "n4": 16},
+                "resampler_depth": 2,
+                "resampler_dim": 512,
+                "resampler_heads": 8,
+                "trainable_groups": ["memory_bridge", "adapter_backbone", "pixart_readout_bridge", "pixart_low_lr"],
+                "lora_rank": int(LORA_RANK),
+                "lora_alpha": int(LORA_ALPHA),
             },
         }
         return state
@@ -1741,35 +1747,18 @@ def main():
         "kv_compress_layer": list(KV_COMPRESS_LAYERS),
     } if KV_COMPRESS_ENABLE else None
 
-    inj_cfg = load_resume_injection_config({
-        "injection_strategy": INJECTION_STRATEGY,
-        "injection_cutoff_layer": INJECTION_CUTOFF_LAYER,
-        "hard_layers": list(HARD_INJECTION_LAYERS),
-        "transition_layers": list(TRANSITION_INJECTION_LAYERS),
-        "detail_layers": list(DETAIL_INJECTION_LAYERS),
-    })
-
     pixart = PixArtSigmaSR_XL_2(
-        input_size=64, in_channels=4, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
-        injection_cutoff_layer=int(inj_cfg["injection_cutoff_layer"]), injection_strategy=str(inj_cfg["injection_strategy"]),
-        hard_injection_layers=list(inj_cfg["hard_layers"]),
-        transition_injection_layers=list(inj_cfg["transition_layers"]),
-        detail_injection_layers=list(inj_cfg["detail_layers"]),
-        dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
-        use_style_fusion=USE_STYLE_FUSION,
+        input_size=64,
+        in_channels=4,
+        out_channels=4,
         kv_compress_config=kv_cfg,
+        adapter_ca_block_ids=ADAPTER_CA_BLOCK_IDS,
     ).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
     if KV_COMPRESS_ENABLE:
         print(f"[KV-Compress] enabled scale={KV_COMPRESS_SCALE} layers={KV_COMPRESS_LAYERS}")
     else:
         print("[KV-Compress] disabled")
-    overlap_start = int(max(0, DUAL_CROSS_ATTN_START))
-    overlap_end = int(min(int(inj_cfg["injection_cutoff_layer"]) - 1, pixart.depth - 1))
-    if overlap_end >= overlap_start:
-        print(f"[Inject×Dual overlap] layers {overlap_start}..{overlap_end}")
-    else:
-        print(f"[Inject×Dual overlap] none (inject< {int(inj_cfg['injection_cutoff_layer'])}, dual>= {DUAL_CROSS_ATTN_START})")
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]

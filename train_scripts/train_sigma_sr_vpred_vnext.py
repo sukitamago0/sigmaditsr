@@ -1,3 +1,4 @@
+# LEGACY / NOT FOR CURRENT MSM-QCA MAINLINE
 # /home/hello/HJT/DiTSR/experiments/train_4090_auto_v8.py
 # DiTSR v8 Training Script (Final Corrected Version)
 # ------------------------------------------------------------------
