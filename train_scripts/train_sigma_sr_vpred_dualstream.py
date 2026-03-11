@@ -44,7 +44,7 @@ from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # [Import V8 Model]
-from diffusion.model.nets.PixArtSigma_SR_dualstream import PixArtSigmaSRDualStream_XL_2
+from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
@@ -119,8 +119,8 @@ GRAD_ACCUM_STEPS = 16
 NUM_WORKERS = 8
 
 LR_BASE = 1e-5 
-LORA_RANK = 16
-LORA_ALPHA = 16
+LORA_RANK = 4
+LORA_ALPHA = 4
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -220,69 +220,13 @@ KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
 # Staged unfreeze for resume from old checkpoint
-TRAIN_STAGE = "A"  # vnext-like unfreeze policy ignores staged gating
-STAGE_C_LATE_BLOCK_FRAC = 1.0
-AUTO_STAGE_ENABLED = True
-
-# Selective tuning (structure-prioritized) for 24GB stability and cleaner attribution.
-ENABLE_SELECTIVE_TUNING = True
-TRAINABLE_BLOCKS_STAGE_A = list(range(4, 18))
-TRAINABLE_BLOCKS_STAGE_B = sorted(set(list(range(4, 18)) + list(range(20, 28))))
-TRAINABLE_BLOCKS_STAGE_C = sorted(set(list(range(4, 18)) + list(range(20, 28))))
-STAGE_CONTROLLER_K = 3
-STAGE_CONTROLLER_PATIENCE = 2
-# Stage thresholds are explicit experiment knobs.
-# Prefer setting these from your current val-pack reference/ceiling stats.
-STAGE_THRESH_A2B = 23.75
-STAGE_THRESH_B2C = 24.75
-
-# Prior-preserving selective adaptation: LoRA windows/ranks by stage block groups.
+TRAIN_STAGE = "single"
+AUTO_STAGE_ENABLED = False
+ENABLE_SELECTIVE_TUNING = False
 ENABLE_LORA = True
-LORA_STRUCT_RANK = 16   # blocks 4-11, attn + mlp_out
-LORA_TRANS_RANK = 8     # blocks 12-17, attn + mlp_out
-LORA_DETAIL_RANK = 4    # blocks 20-27, attn only
-
-PHASE_RUNTIME_CFG = {
-    "A": {
-        "cond_aug_noise_range": (0.0, 0.0),
-        "cond_drop_prob": 0.0,
-        "concat_lr_drop_enabled": False,
-        "concat_lr_drop_schedule": [(0, 0.0)],
-        "edge_grad_weight": 0.01,
-        "lr_consist_weight_max": 0.02,
-        "enable_lpips": False,
-    },
-    "B": {
-        "cond_aug_noise_range": (0.0, 0.03),
-        "cond_drop_prob": 0.05,
-        "concat_lr_drop_enabled": True,
-        "concat_lr_drop_schedule": [
-            (0, 0.0),
-            (1000, 0.0),
-            (4000, 0.2),
-            (12000, 0.3),
-            (20000, 0.1),
-        ],
-        "edge_grad_weight": 0.02,
-        "lr_consist_weight_max": 0.05,
-        "enable_lpips": False,
-    },
-    "C": {
-        "cond_aug_noise_range": (0.0, 0.05),
-        "cond_drop_prob": 0.10,
-        "concat_lr_drop_enabled": True,
-        "concat_lr_drop_schedule": [
-            (0, 0.0),
-            (1000, 0.0),
-            (4000, 0.4),
-            (12000, 0.4),
-            (20000, 0.1),
-        ],
-        "edge_grad_weight": 0.02,
-        "lr_consist_weight_max": 0.08,
-        "enable_lpips": False,
-    },
-}
+ADAPTER_READ_STAGE = os.getenv("ADAPTER_READ_STAGE", "A").upper()  # A | B
+if ADAPTER_READ_STAGE not in ("A", "B"):
+    raise ValueError(f"Invalid ADAPTER_READ_STAGE={ADAPTER_READ_STAGE}, expected A or B")
 
 # Phase0 safety: check zero-impact regression before training
 RUN_PHASE0_REGRESSION_TEST = False
@@ -295,23 +239,15 @@ PHASE0_NUM_SAMPLES = 4
 # ================= 3. Logic Functions =================
 
 
-def get_phase_runtime_cfg(stage: str):
-    stage = str(stage).upper()
-    if stage in PHASE_RUNTIME_CFG:
-        return PHASE_RUNTIME_CFG[stage]
-    return PHASE_RUNTIME_CFG["C"]
-
-def get_loss_weights(global_step, stage: str):
-    runtime_cfg = get_phase_runtime_cfg(stage)
-    lr_consist_weight_max = float(runtime_cfg['lr_consist_weight_max'])
-    edge_grad_weight = float(runtime_cfg.get('edge_grad_weight', EDGE_GRAD_WEIGHT))
-    weights = {'mse': 1.0, 'latent_l1': L1_BASE_WEIGHT}
-    # Main experiment: disable LPIPS / flat_hf for structure-first fidelity.
-    weights['lpips'] = 0.0
-    weights['edge_grad'] = edge_grad_weight
-    weights['flat_hf'] = 0.0
-    weights['lr_cons'] = lr_consist_weight_max if USE_LR_CONSISTENCY else 0.0
-    return weights
+def get_fixed_loss_weights():
+    return {
+        "mse": 1.0,
+        "latent_l1": 0.10,
+        "lpips": 0.0,
+        "edge_grad": 0.01,
+        "flat_hf": 0.0,
+        "lr_cons": 0.05,
+    }
 
 
 def inject_reg_lambda(step: int) -> float:
@@ -324,24 +260,19 @@ def inject_reg_lambda(step: int) -> float:
 
 
 def get_concat_lr_drop_p(global_step: int, stage: str) -> float:
-    runtime_cfg = get_phase_runtime_cfg(stage)
-    concat_enabled = bool(runtime_cfg['concat_lr_drop_enabled'])
-    concat_schedule = runtime_cfg['concat_lr_drop_schedule']
-    if (not concat_enabled) or (concat_schedule is None) or (len(concat_schedule) == 0):
+    del stage
+    if (not CONCAT_LR_DROP_ENABLED) or (CONCAT_LR_DROP_SCHEDULE is None) or (len(CONCAT_LR_DROP_SCHEDULE) == 0):
         return 0.0
     s = int(global_step)
-    sched = sorted([(int(k), float(v)) for k, v in concat_schedule], key=lambda x: x[0])
-
+    sched = sorted([(int(k), float(v)) for k, v in CONCAT_LR_DROP_SCHEDULE], key=lambda x: x[0])
     if s <= sched[0][0]:
         return float(sched[0][1])
-
     for (a_step, a_p), (b_step, b_p) in zip(sched[:-1], sched[1:]):
         if a_step <= s <= b_step:
             if b_step == a_step:
                 return float(b_p)
             t = (s - a_step) / float(b_step - a_step)
             return float(a_p + (b_p - a_p) * t)
-
     return float(sched[-1][1])
 
 
@@ -424,18 +355,9 @@ def edge_guided_losses(pred_m11: torch.Tensor, gt_m11: torch.Tensor, q: float = 
 # -------------------------------------------------------------------------------
 
 @torch.cuda.amp.autocast(enabled=False)
-def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
-    # 4ch structural-only input: [GaussianLowpass(gray), gray, SobelMag, |Laplacian|]
-    gray = _to_luma01(lr_m11)
-    kx = _SOBEL_X.to(device=gray.device)
-    ky = _SOBEL_Y.to(device=gray.device)
-    kl = _LAPLACE.to(device=gray.device)
-    gx = F.conv2d(gray, kx, padding=1)
-    gy = F.conv2d(gray, ky, padding=1)
-    sobel_mag = torch.sqrt(gx * gx + gy * gy + 1e-6)
-    lap_abs = F.conv2d(gray, kl, padding=1).abs()
-    lowpass = F.avg_pool2d(gray, kernel_size=7, stride=1, padding=3)
-    return torch.cat([lowpass, gray, sobel_mag, lap_abs], dim=1).clamp(0.0, 1.0)
+def build_adapter_struct_input(lr_small_m11: torch.Tensor) -> torch.Tensor:
+    # Keep as real lr_small tensor; no resize/back-projection from lr_up.
+    return lr_small_m11.float().clamp(-1.0, 1.0)
 
 
 @torch.cuda.amp.autocast(enabled=False)
@@ -693,18 +615,16 @@ def get_config_snapshot():
         "lora_rank": LORA_RANK,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights": "Dynamic",
+        "loss_weights": "Lv+0.10L1+0.05LRcons+0.01Edge",
+        "adapter_type": "SRConvNetLSA",
+        "all_block_injection": True,
         "seed": SEED,
     }
 
 
 def validate_schedule_alignment():
-    # Stage progression is controlled by StageController (PSNR-driven).
-    if not (STAGE_THRESH_A2B < STAGE_THRESH_B2C):
-        raise ValueError(
-            f"Stage thresholds must satisfy STAGE_THRESH_A2B < STAGE_THRESH_B2C, got "
-            f"{STAGE_THRESH_A2B} >= {STAGE_THRESH_B2C}."
-        )
+    # Single-stage training: no stage schedule validation required.
+    return
 
 
 def validate_s2d_decoupling():
@@ -1054,7 +974,8 @@ class DF2K_Online_Dataset(Dataset):
         lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+        lr_small_tensor = self.norm(self.to_tensor(lr_crop))
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
     def __init__(self, hr_root, lr_root=None, crop_size=512):
@@ -1071,15 +992,17 @@ class DF2K_Val_Fixed_Dataset(Dataset):
             if os.path.exists(lr_p):
                 lr_pil = Image.open(lr_p).convert("RGB")
                 lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=4)
-                lr_crop = TF.center_crop(lr_aligned, (self.crop_size//4, self.crop_size//4))
+                lr_small_pil = TF.center_crop(lr_aligned, (self.crop_size//4, self.crop_size//4))
                 hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
-                lr_crop = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         if lr_crop is None:
             hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
-            w, h = hr_crop.size; lr_small = hr_crop.resize((w//4, h//4), Image.BICUBIC)
-            lr_crop = lr_small.resize((w, h), Image.BICUBIC)
-        hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+            w, h = hr_crop.size
+            lr_small_pil = hr_crop.resize((w//4, h//4), Image.BICUBIC)
+        lr_up_pil = lr_small_pil.resize((self.crop_size, self.crop_size), Image.BICUBIC)
+        hr_tensor = self.norm(self.to_tensor(hr_crop))
+        lr_tensor = self.norm(self.to_tensor(lr_up_pil))
+        lr_small_tensor = self.norm(self.to_tensor(lr_small_pil))
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
 
 class DF2K_Val_Degraded_Dataset(Dataset):
     def __init__(self, hr_root, crop_size=512, seed=3407, deg_mode="highorder"):
@@ -1093,14 +1016,16 @@ class DF2K_Val_Degraded_Dataset(Dataset):
         hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         if self.deg_mode == "bicubic":
-            lr_small = TF.resize((hr_tensor + 1.0) * 0.5, (self.crop_size // 4, self.crop_size // 4), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-            lr_tensor = TF.resize(lr_small, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-            lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
+            lr_small01 = TF.resize((hr_tensor + 1.0) * 0.5, (self.crop_size // 4, self.crop_size // 4), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_up01 = TF.resize(lr_small01, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_tensor = (lr_up01 * 2.0 - 1.0).clamp(-1.0, 1.0)
+            lr_small_tensor = (lr_small01 * 2.0 - 1.0).clamp(-1.0, 1.0)
         else:
             gen = torch.Generator(); gen.manual_seed(self.seed + idx)
-            # Ensure only 2 values unpacked
-            lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen) # Ignore meta here
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+            lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen)
+            # fallback when pipeline only outputs lr_up
+            lr_small_tensor = F.interpolate(lr_tensor.unsqueeze(0), size=(self.crop_size // 4, self.crop_size // 4), mode="bicubic", align_corners=False, antialias=True).squeeze(0).clamp(-1.0, 1.0)
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
 
 class ValPackDataset(Dataset):
     def __init__(self, pack_dir: str, lr_dir_name: str = "lq512", crop_size: int = 512):
@@ -1118,7 +1043,8 @@ class ValPackDataset(Dataset):
         if lr_crop.size != (self.crop_size, self.crop_size):
             lr_crop = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": str(hr_path)}
+        lr_small_tensor = F.interpolate(lr_tensor.unsqueeze(0), size=(self.crop_size // 4, self.crop_size // 4), mode="bicubic", align_corners=False, antialias=True).squeeze(0).clamp(-1.0, 1.0)
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": str(hr_path)}
 
 class RealSR_Val_Paired_Dataset(Dataset):
     def __init__(self, roots, crop_size=512):
@@ -1161,7 +1087,8 @@ class RealSR_Val_Paired_Dataset(Dataset):
 
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up))
-        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+        lr_small_tensor = self.norm(self.to_tensor(lr_crop))
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
 
 
 # ================= 7. LoRA =================
@@ -1186,22 +1113,8 @@ def _block_id_from_name(name: str):
 
 
 def _lora_target_kind(module_name: str):
-    attn_keys = ("qkv", "proj", "to_q", "to_k", "to_v", "q_linear", "kv_linear")
-    mlp_out_keys = ("mlp.fc2", "ff.net.2", "mlp.proj", "mlp.2")
-    if any(k in module_name for k in attn_keys):
+    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
         return "attn"
-    if any(k in module_name for k in mlp_out_keys):
-        return "mlp_out"
-    return None
-
-
-def _lora_rank_for_block(block_id: int, kind: str):
-    if 4 <= block_id <= 11:
-        return LORA_STRUCT_RANK if kind in ("attn", "mlp_out") else None
-    if 12 <= block_id <= 17:
-        return LORA_TRANS_RANK if kind in ("attn", "mlp_out") else None
-    if 20 <= block_id <= 27:
-        return LORA_DETAIL_RANK if kind == "attn" else None
     return None
 
 
@@ -1216,89 +1129,37 @@ def apply_lora(model):
         kind = _lora_target_kind(name)
         if kind is None:
             continue
-        rank = _lora_rank_for_block(block_id, kind)
-        if rank is None:
+        if not (0 <= block_id <= 27):
             continue
+        rank = int(LORA_RANK)
         parent = model.get_submodule(name.rsplit('.', 1)[0])
         child = name.rsplit('.', 1)[1]
-        setattr(parent, child, LoRALinear(module, rank, alpha=float(rank)))
+        setattr(parent, child, LoRALinear(module, rank, alpha=float(LORA_ALPHA)))
         cnt += 1
-    print(f"✅ Windowed LoRA applied to {cnt} layers.")
+    print(f"✅ Attention LoRA applied to {cnt} layers (rank={LORA_RANK}, alpha={LORA_ALPHA}).")
 
 
-def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = True, train_stage: str = "C"):
-    train_stage = str(train_stage).upper()
+def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False, stage: str = "A"):
+    stage = str(stage).upper()
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
-
-    # Default: freeze all, then selectively unfreeze task-relevant modules.
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = [
-        "aug_embedder",
-        "final_layer",
-        "input_adaln",
-        "input_res_proj",
-        "alpha_struct",
-        "alpha_trans",
-        "alpha_detail",
-        "injection_scales",
-        "csft_dw",
-        "csft_pw",
-        "sem_norm",
-        "sem_q",
-        "sem_kv",
-        "sem_out",
-        "sem_gate",
-    ]
-    if train_x_embedder:
-        always_train_keywords.append("x_embedder")
-    if DUALSTREAM_ENABLED:
-        always_train_keywords.extend(["lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate"])
-    if ENABLE_LORA:
-        always_train_keywords.extend(["lora_A", "lora_B"])
+    if stage == "A":
+        always_train_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]
+    else:
+        always_train_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate", "final_layer"]
+        if ENABLE_LORA:
+            always_train_keywords.extend(["lora_A", "lora_B"])
 
-    enabled = 0
     for n, p in pixart.named_parameters():
         if any(k in n for k in always_train_keywords):
             p.requires_grad_(True)
-            enabled += 1
 
-    # Prior-preserving adaptation: keep base block weights frozen, enable windowed LoRA only.
-    lora_block_ids = list(TRAINABLE_BLOCKS_STAGE_A)
-    if train_stage == "B":
-        lora_block_ids = list(TRAINABLE_BLOCKS_STAGE_B)
-    elif train_stage == "C":
-        lora_block_ids = list(TRAINABLE_BLOCKS_STAGE_C)
-    active_lora_blocks = sorted(set(int(v) for v in lora_block_ids))
-
-    active_injection_layers = set(get_stage_injection_layers(train_stage))
-    if hasattr(pixart, "injection_index_map"):
-        for layer_id, scale_idx in pixart.injection_index_map.items():
-            is_active = int(layer_id) in active_injection_layers
-            for p in pixart.input_adaln[int(scale_idx)].parameters():
-                p.requires_grad_(is_active)
-            for p in pixart.input_res_proj[int(scale_idx)].parameters():
-                p.requires_grad_(is_active)
-            pixart.injection_scales[int(scale_idx)].requires_grad_(is_active)
-            for p in pixart.csft_dw[int(scale_idx)].parameters():
-                p.requires_grad_(is_active)
-            for p in pixart.csft_pw[int(scale_idx)].parameters():
-                p.requires_grad_(is_active)
-
-    if hasattr(pixart, "alpha_struct"):
-        pixart.alpha_struct.requires_grad_(True)
-    if hasattr(pixart, "alpha_trans"):
-        pixart.alpha_trans.requires_grad_(train_stage in ("B", "C"))
-    if hasattr(pixart, "alpha_detail"):
-        pixart.alpha_detail.requires_grad_(train_stage in ("B", "C"))
-
-    x_embedder_frozen = 0
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
             if "x_embedder" in n and p.requires_grad:
                 p.requires_grad_(False)
-                x_embedder_frozen += 1
 
     if ENABLE_LORA:
         for n, p in pixart.named_parameters():
@@ -1308,132 +1169,15 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             if ("lora_A" in n) or ("lora_B" in n):
                 bid = _block_id_from_name(n)
                 kind = _lora_target_kind(n)
-                p.requires_grad_(bool(bid is not None and bid in active_lora_blocks and kind is not None))
+                p.requires_grad_(bool(p.requires_grad and bid is not None and 0 <= bid <= 27 and kind == "attn"))
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
-
-    if hasattr(pixart, "enable_semantic_detail"):
-        pixart.enable_semantic_detail = (train_stage in ("C",))
-
-    mode = "prior_preserving_lora" if ENABLE_LORA else "selective"
-    print(
-        "✅ PixArt trainable configured: "
-        f"mode={mode}, before={total_trainable_before}, after={total_trainable_after}, "
-        f"stage={train_stage}, x_embedder_enabled={train_x_embedder}, x_embedder_frozen={x_embedder_frozen}, "
-        f"lora_window={active_lora_blocks}"
-    )
-
-class StageController:
-    def __init__(self, k: int = 3, patience: int = 2, th_a2b: float = 24.0, th_b2c: float = 25.0, initial_stage: str = "A"):
-        self.k = int(max(1, k))
-        self.patience = int(max(1, patience))
-        self.th_a2b = float(th_a2b)
-        self.th_b2c = float(th_b2c)
-        self.current_stage = str(initial_stage).upper()
-        self.psnr_history = []
-        self.hit_count = 0
-        self.smoothed_psnr = None
-        self.should_advance = False
-        self.baseline_psnr = None
-        self.dynamic_threshold_initialized = False
-
-    def state_dict(self):
-        return {
-            'k': self.k,
-            'patience': self.patience,
-            'th_a2b': self.th_a2b,
-            'th_b2c': self.th_b2c,
-            'current_stage': self.current_stage,
-            'psnr_history': list(self.psnr_history),
-            'hit_count': int(self.hit_count),
-            'smoothed_psnr': None if self.smoothed_psnr is None else float(self.smoothed_psnr),
-            'baseline_psnr': None if self.baseline_psnr is None else float(self.baseline_psnr),
-            'dynamic_threshold_initialized': bool(self.dynamic_threshold_initialized),
-        }
-
-    def load_state_dict(self, sd: dict):
-        if not isinstance(sd, dict):
-            return
-        self.k = int(sd.get('k', self.k))
-        self.patience = int(sd.get('patience', self.patience))
-        self.th_a2b = float(sd.get('th_a2b', self.th_a2b))
-        self.th_b2c = float(sd.get('th_b2c', self.th_b2c))
-        self.current_stage = str(sd.get('current_stage', self.current_stage)).upper()
-        self.psnr_history = [float(v) for v in sd.get('psnr_history', [])]
-        self.hit_count = int(sd.get('hit_count', 0))
-        self.smoothed_psnr = sd.get('smoothed_psnr', None)
-        self.baseline_psnr = sd.get('baseline_psnr', None)
-        if 'dynamic_threshold_initialized' in sd:
-            self.dynamic_threshold_initialized = bool(sd.get('dynamic_threshold_initialized', False))
-        else:
-            # Backward-compat: if checkpoint already stores thresholds, preserve them on resume.
-            self.dynamic_threshold_initialized = ('th_a2b' in sd) and ('th_b2c' in sd)
-
-    def maybe_init_dynamic_thresholds(self, baseline_psnr: float):
-        if self.dynamic_threshold_initialized:
-            return
-        self.baseline_psnr = float(baseline_psnr)
-        self.th_a2b = max(15.5, self.baseline_psnr + 1.0)
-        self.th_b2c = max(17.5, self.baseline_psnr + 2.5)
-        if self.th_b2c <= self.th_a2b:
-            self.th_b2c = self.th_a2b + 0.5
-        self.dynamic_threshold_initialized = True
-
-    def _target_threshold(self):
-        if self.current_stage == 'A':
-            return self.th_a2b
-        if self.current_stage == 'B':
-            return self.th_b2c
-        return None
-
-    def update(self, val_psnr: float):
-        self.should_advance = False
-        self.maybe_init_dynamic_thresholds(val_psnr)
-        self.psnr_history.append(float(val_psnr))
-        if len(self.psnr_history) > max(32, self.k * 4):
-            self.psnr_history = self.psnr_history[-max(32, self.k * 4):]
-        tail = self.psnr_history[-self.k:]
-        self.smoothed_psnr = float(np.mean(tail))
-        th = self._target_threshold()
-        if th is None:
-            self.hit_count = 0
-            return False
-        if len(tail) < self.k:
-            return False
-        if self.smoothed_psnr >= th:
-            self.hit_count += 1
-        else:
-            self.hit_count = 0
-        if self.hit_count >= self.patience:
-            prev = self.current_stage
-            if self.current_stage == 'A':
-                self.current_stage = 'B'
-            elif self.current_stage == 'B':
-                self.current_stage = 'C'
-            self.hit_count = 0
-            self.should_advance = (self.current_stage != prev)
-            return self.should_advance
-        return False
-
-
-def get_stage_injection_layers(stage: str):
-    stage = str(stage).upper()
-    hard = set(HARD_INJECTION_LAYERS)
-    trans = set(TRANSITION_INJECTION_LAYERS)
-    detail = set(DETAIL_INJECTION_LAYERS)
-    if stage == "A":
-        return sorted(hard | trans)
-    if stage == "B":
-        # Stage B keeps structure-only injection set; only loss policy changes.
-        return sorted(hard | trans)
-    # Stage C unlocks detail layers together with semantic detail path.
-    return sorted(hard | trans | detail)
+    print(f"✅ PixArt trainable configured(stage={stage}): before={total_trainable_before}, after={total_trainable_after}")
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
-    # Full-unfreeze run: persist all PixArt parameters for stable resume.
     keep = {n for n, _ in pixart.named_parameters()}
     if not train_x_embedder:
         keep = {n for n in keep if "x_embedder" not in n}
@@ -1445,77 +1189,58 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    inject_gate_keys = INJECT_GATE_KEYWORDS
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, stage: str = "A"):
+    stage = str(stage).upper()
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
 
-    dual_params = []
-    embedder_params = []
-    inject_gate_params = []
-    lora_params = []
-    final_head_params = []
-    csft_params = []
-    other_pixart_params = []
-
-    dual_keys = ("lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate")
+    pix_lora, pix_final, pix_ca = [], [], []
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if any(k in n for k in dual_keys):
-            dual_params.append(p)
-        elif "x_embedder" in n:
-            embedder_params.append(p)
-        elif any(k in n for k in inject_gate_keys):
-            inject_gate_params.append(p)
-        elif ("lora_A" in n) or ("lora_B" in n):
-            lora_params.append(p)
-        elif FINAL_LAYER_KEYWORD in n:
-            final_head_params.append(p)
-        elif ("csft_dw" in n) or ("csft_pw" in n):
-            csft_params.append(p)
+        if ("lora_A" in n) or ("lora_B" in n):
+            pix_lora.append(p)
+        elif "final_layer" in n:
+            pix_final.append(p)
+        elif ("adapter_ca_" in n) or ("adapter_ca_layers" in n):
+            pix_ca.append(p)
         else:
-            other_pixart_params.append(p)
+            pix_ca.append(p)
 
     optim_groups = []
-    if len(dual_params) > 0:
-        optim_groups.append({"params": dual_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(adapter_params) > 0:
-        optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(inject_gate_params) > 0:
-        optim_groups.append({"params": inject_gate_params, "lr": 3e-4, "weight_decay": 0.0})
-    if len(lora_params) > 0:
-        optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.0})
-    if len(final_head_params) > 0:
-        optim_groups.append({"params": final_head_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(csft_params) > 0:
-        optim_groups.append({"params": csft_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(other_pixart_params) > 0:
-        optim_groups.append({"params": other_pixart_params, "lr": 1e-5, "weight_decay": 0.01})
-    if TRAIN_PIXART_X_EMBEDDER and len(embedder_params) > 0:
-        optim_groups.append({"params": embedder_params, "lr": 1e-4, "weight_decay": 0.01})
+    if stage == "A":
+        if len(adapter_params) > 0:
+            optim_groups.append({"params": adapter_params, "lr": 1e-4, "weight_decay": 0.01})
+        if len(pix_ca) > 0:
+            optim_groups.append({"params": pix_ca, "lr": 5e-5, "weight_decay": 0.01})
+    else:
+        if len(adapter_params) > 0:
+            optim_groups.append({"params": adapter_params, "lr": 2e-5, "weight_decay": 0.01})
+        if len(pix_ca) > 0:
+            optim_groups.append({"params": pix_ca, "lr": 2e-5, "weight_decay": 0.01})
+        if len(pix_final) > 0:
+            optim_groups.append({"params": pix_final, "lr": 5e-6, "weight_decay": 0.01})
+        if len(pix_lora) > 0:
+            optim_groups.append({"params": pix_lora, "lr": 5e-6, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + dual_params + inject_gate_params + lora_params + final_head_params + csft_params + other_pixart_params + embedder_params
+    params_to_clip = adapter_params + pix_ca + pix_final + pix_lora
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = dual_params + embedder_params + inject_gate_params + lora_params + final_head_params + csft_params + other_pixart_params
+    grouped = pix_ca + pix_final + pix_lora
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
         raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
 
     group_counts = {
-        "dual": len(dual_params),
-        "inject": len(inject_gate_params),
-        "lora": len(lora_params),
-        "final_head": len(final_head_params),
-        "csft": len(csft_params),
-        "other": len(other_pixart_params),
-        "x_embedder": len(embedder_params),
         "adapter": len(adapter_params),
+        "pix_ca": len(pix_ca),
+        "final_head": len(pix_final),
+        "lora": len(pix_lora),
+        "stage": stage,
     }
     return optimizer, params_to_clip, group_counts
 
@@ -1529,8 +1254,8 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.input_res_proj.0.weight", pix_named.get("input_res_proj.0.weight", None)),
         ("pixart.input_adaln.0.weight", pix_named.get("input_adaln.0.weight", None)),
-        ("adapter.heads.2.2.weight", ad_named.get("heads.2.2.weight", None)),
-        ("pixart.sem_out.14.weight", pix_named.get("sem_out.14.weight", None)),
+        ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
+        ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
     warnings = []
@@ -1547,24 +1272,6 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     if warnings:
         print(f"⚠️ [GradSanity] near-zero grad on critical paths: {warnings}")
 
-
-def apply_stage_switch(pixart: nn.Module, adapter: nn.Module, stage: str, ever_keys: set):
-    stage = str(stage).upper()
-    pixart.active_injection_layers = get_stage_injection_layers(stage)
-    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, train_stage=stage)
-    for p in adapter.parameters():
-        p.requires_grad_(True)
-
-    ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
-    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
-    print(
-        "✅ Optim groups (pixart): "
-        f"dual={group_counts['dual']}, inject={group_counts['inject']}, lora={group_counts['lora']}, "
-        f"final_head={group_counts['final_head']}, other={group_counts['other']}, "
-        f"x_embedder={group_counts['x_embedder']}, adapter={group_counts['adapter']}, "
-        f"active_inject_layers={pixart.active_injection_layers}"
-    )
-    return optimizer, params_to_clip
 
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
@@ -1601,14 +1308,11 @@ def save_smart(
     dl_gen,
     ema=None,
     keep_keys=None,
-    train_stage="A",
-    stage_schedule=None,
     eval_source: str = "raw",
     eval_steps: int = 50,
     eval_tag: str = "",
     export_eval_weights: bool = True,
     ema_named_params=None,
-    stage_controller_state=None,
 ):
     global BASE_PIXART_SHA256
     eval_source = str(eval_source).lower()
@@ -1688,8 +1392,6 @@ def save_smart(
             "base_pixart_sha256": BASE_PIXART_SHA256,
             "env_info": {"torch": torch.__version__, "numpy": np.__version__},
             "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
-            "train_stage": str(train_stage).upper(),
-            "stage_schedule": dict(stage_schedule or {}),
             "checkpoint_role": str(checkpoint_role),
             "best_eval_source": source_tag,
             "best_eval_steps": int(eval_steps),
@@ -1702,7 +1404,6 @@ def save_smart(
                 "transition_layers": list(TRANSITION_INJECTION_LAYERS),
                 "detail_layers": list(DETAIL_INJECTION_LAYERS),
             },
-            "stage_controller": dict(stage_controller_state or {}),
         }
         return state
 
@@ -1742,6 +1443,22 @@ def save_smart(
                         pass
     return next_best_records if save_as_best else best_records
 
+
+
+def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context: str = "load"):
+    curr = model.state_dict()
+    filt = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in curr and tuple(v.shape) == tuple(curr[k].shape):
+            filt[k] = v
+        else:
+            skipped.append(k)
+    missing, unexpected = model.load_state_dict(filt, strict=False)
+    print(f"[{context}] compatible load: loaded={len(filt)}, skipped_shape_or_missing={len(skipped)}, missing={len(missing)}, unexpected={len(unexpected)}")
+    if len(skipped) > 0:
+        print(f"[{context}] skipped examples: {skipped[:5]}")
+    return missing, unexpected, skipped
 def _load_pixart_trainable_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
     saved = set(saved_trainable.keys())
     model_keys = set(pixart.state_dict().keys())
@@ -1784,8 +1501,8 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
     adapter_sd = ckpt.get("adapter", None)
     if isinstance(adapter_sd, dict):
         try:
-            adapter.load_state_dict(adapter_sd, strict=True)
-            print("✅ Adapter bootstrap load succeeded.")
+            miss, unexp, sk = load_state_dict_shape_compatible(adapter, adapter_sd, context="init-adapter")
+            print(f"✅ Adapter bootstrap load: missing={len(miss)}, unexpected={len(unexp)}, skipped={len(sk)}")
         except Exception as e:
             print(f"⚠️ Adapter bootstrap load skipped due to mismatch: {e}")
     return True
@@ -1846,7 +1563,7 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
             print(f"✅ EMA restored: {len(ema.shadow)} tensors")
         else:
             print("ℹ️ EMA state not found in checkpoint; proceeding without EMA restore.")
-    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), ckpt.get("stage_controller", None)
+    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None
 
 # ================= 9. Validation =================
 def run_phase0_regression_check(pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
@@ -1915,20 +1632,22 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
             
-            adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
-            with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, sem_image=lr, return_style=USE_STYLE_FUSION)
+            lr_small = batch["lr_small"].to(DEVICE, dtype=COMPUTE_DTYPE)
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
                 t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
+                with torch.no_grad():
+                    t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
+                with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+                    cond = adapter(lr_small, t_embed=t_embed)
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     if FORCE_DROP_TEXT: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.ones(latents.shape[0], device=DEVICE)
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, injection_mode="hybrid", force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond)
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond)
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
@@ -2037,7 +1756,7 @@ def main():
         "detail_layers": list(DETAIL_INJECTION_LAYERS),
     })
 
-    pixart = PixArtSigmaSRDualStream_XL_2(
+    pixart = PixArtSigmaSR_XL_2(
         input_size=64, in_channels=4, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=int(inj_cfg["injection_cutoff_layer"]), injection_strategy=str(inj_cfg["injection_strategy"]),
         hard_injection_layers=list(inj_cfg["hard_layers"]),
@@ -2066,8 +1785,8 @@ def main():
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
     else:
-        missing, unexpected = pixart.load_state_dict(base, strict=False)
-        print(f"[Load] missing={len(missing)} unexpected={len(unexpected)}")
+        missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+        print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
     if ENABLE_LORA:
         apply_lora(pixart)
     else:
@@ -2099,7 +1818,7 @@ def main():
 
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
-    # Stage-aware optimizer is built via apply_stage_switch()
+    # Single-stage optimizer is built once.
 
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
     # We will manually calculate v_target and loss.
@@ -2122,36 +1841,21 @@ def main():
     if not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
         init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
 
-    # Build controller first. If resuming, pre-read controller stage from checkpoint
-    # so optimizer param-groups are initialized with matching stage before resume().
-    resume_stage_controller_state = None
-    if os.path.exists(LAST_CKPT_PATH):
-        try:
-            _resume_ckpt_meta = torch.load(LAST_CKPT_PATH, map_location="cpu")
-            resume_stage_controller_state = _resume_ckpt_meta.get("stage_controller", None)
-        except Exception as e:
-            print(f"⚠️ Failed to pre-read stage controller from resume checkpoint: {e}")
-
-    controller = StageController(
-        k=STAGE_CONTROLLER_K,
-        patience=STAGE_CONTROLLER_PATIENCE,
-        th_a2b=STAGE_THRESH_A2B,
-        th_b2c=STAGE_THRESH_B2C,
-        initial_stage=str(TRAIN_STAGE).upper(),
-    )
-    if resume_stage_controller_state is not None:
-        controller.load_state_dict(resume_stage_controller_state)
-
-    current_stage = controller.current_stage
+    configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER, stage=ADAPTER_READ_STAGE)
+    for n, p in adapter.named_parameters():
+        if ADAPTER_READ_STAGE == "A":
+            p.requires_grad_(any(k in n for k in ["mem_proj_", "resampler", "memory_out_proj", "memory_ln", "pos_proj", "scale_embed", "q2", "q3", "q4"]))
+        else:
+            p.requires_grad_(True)
+    ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter, stage=ADAPTER_READ_STAGE)
+    print(f"✅ Optim groups(stage={ADAPTER_READ_STAGE}): {group_counts}")
     _maybe_empty_cuda_cache()
 
-    ep_start, step, best, stage_controller_state = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
-    if stage_controller_state is not None:
-        controller.load_state_dict(stage_controller_state)
-    current_stage = controller.current_stage
+    print(f"[ShapeCheck][train] depth={getattr(pixart, 'depth', -1)} hidden={getattr(pixart, 'hidden_size', -1)} ca_blocks={getattr(pixart, 'adapter_ca_block_ids', [])}")
 
+    ep_start, step, best, _ = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
     if ema is not None:
         ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
         ema.register(ema_named_params)
@@ -2173,7 +1877,7 @@ def main():
                 reached_max_steps = True
                 break
 
-            hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE)
+            hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE); lr_small_b = batch['lr_small']
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
                 zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
@@ -2183,7 +1887,7 @@ def main():
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
-            runtime_cfg = get_phase_runtime_cfg(current_stage)
+            runtime_cfg = {"cond_aug_noise_range": COND_AUG_NOISE_RANGE, "cond_drop_prob": COND_DROP_PROB}
 
             # [V8 Logic] Conditioning Augmentation
             # 1. Sample noise level for LR
@@ -2193,9 +1897,12 @@ def main():
             # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = (aug_noise_level * 1000.0).float()
 
-            adapter_in = build_adapter_struct_input(lr).to(dtype=COMPUTE_DTYPE)
+            adapter_in = lr_small_b.to(DEVICE)
+            adapter_in = adapter_in.to(dtype=COMPUTE_DTYPE)
+            with torch.no_grad():
+                t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, sem_image=lr, return_style=USE_STYLE_FUSION) # Adapter sees image-domain structure guidance
+                cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
             cond_in = cond
             cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
@@ -2204,7 +1911,7 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in)
                 kwargs["force_drop_ids"] = drop_uncond
 
                 out = pixart(**kwargs)
@@ -2237,7 +1944,7 @@ def main():
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
-                w = get_loss_weights(step, current_stage)
+                w = get_fixed_loss_weights()
                 
                 # Calculate pixel-space losses
                 loss_edge = torch.tensor(0.0, device=DEVICE)
@@ -2247,7 +1954,7 @@ def main():
 
                 need_pixel_loss = (w['lpips'] > 0) or (w['edge_grad'] > 0) or (w['flat_hf'] > 0) or (w.get('lr_cons', 0.0) > 0)
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
-                allow_by_stage = (current_stage in ("A", "B", "C"))
+                allow_by_stage = True
                 pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
                 calc_pixel_loss = need_pixel_loss and allow_by_stage and (pixel_loss_num_samples > 0)
 
@@ -2318,6 +2025,23 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
+                rw = getattr(pixart, "_last_route_weights", None)
+                if torch.is_tensor(rw):
+                    rE = float(rw[:, 0].mean().item())
+                    rM = float(rw[:, 1].mean().item())
+                    rL = float(rw[:, 2].mean().item())
+                else:
+                    rE = rM = rL = 0.0
+                ca_g = getattr(pixart, "_last_adapter_ca_gates", None)
+                if torch.is_tensor(ca_g):
+                    ca_gate_mean = float(ca_g.mean().item())
+                    ca_gate_norm = float(torch.norm(ca_g, p=2).item())
+                else:
+                    ca_gate_mean = 0.0
+                    ca_gate_norm = 0.0
+                mem_shape = "-"
+                if isinstance(cond_in, dict) and torch.is_tensor(cond_in.get("memory_tokens", None)):
+                    mem_shape = "x".join(str(int(v)) for v in cond_in["memory_tokens"].shape)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2333,6 +2057,12 @@ def main():
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
+                    'ca_g': f"{ca_gate_mean:.3f}",
+                    'ca_n': f"{ca_gate_norm:.3f}",
+                    'm': mem_shape,
+                    'rE_legacy': f"{rE:.3f}",
+                    'rM_legacy': f"{rM:.3f}",
+                    'rL_legacy': f"{rL:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
@@ -2385,20 +2115,7 @@ def main():
             f"LPIPS={best_eval_metrics_this_round[2]:.4f}"
         )
 
-        advanced = controller.update(float(best_eval_metrics_this_round[0]))
-        print(
-            f"[StageController] stage={controller.current_stage} smooth_psnr={controller.smoothed_psnr:.3f} "
-            f"hit_count={controller.hit_count} advanced={advanced}"
-        )
-        if advanced and controller.current_stage != current_stage:
-            print(f"🔁 Stage switch (controller): {current_stage} -> {controller.current_stage} @ step={step}")
-            current_stage = controller.current_stage
-            optimizer, params_to_clip = apply_stage_switch(pixart, adapter, current_stage, ever_keys)
-            _maybe_empty_cuda_cache()
-            optimizer.zero_grad(set_to_none=True)
-            if ema is not None:
-                ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
-                ema.register(ema_named_params)
+        print(f"[SingleStage] val_psnr={float(best_eval_metrics_this_round[0]):.3f}")
 
         best = save_smart(
             epoch,
@@ -2411,9 +2128,6 @@ def main():
             dl_gen,
             ema=ema,
             keep_keys=ever_keys,
-            train_stage=current_stage,
-            stage_schedule={"enabled": True, "controller": True},
-            stage_controller_state=controller.state_dict(),
             eval_source=best_eval_source_this_round,
             eval_steps=int(BEST_VAL_STEPS),
             eval_tag=f"val{validation_count}",

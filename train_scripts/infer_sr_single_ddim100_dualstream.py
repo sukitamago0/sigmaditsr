@@ -15,7 +15,7 @@ from torchvision import transforms
 from PIL import Image
 from diffusers import AutoencoderKL, DDIMScheduler
 
-from diffusion.model.nets.PixArtSigma_SR_dualstream import PixArtSigmaSRDualStream_XL_2
+from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
 
 
@@ -40,19 +40,8 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 
 
 
-def build_adapter_struct_input(lr_m11: torch.Tensor) -> torch.Tensor:
-    # 4ch structural-only input: [GaussianLowpass(gray), gray, SobelMag, |Laplacian|]
-    img01 = (lr_m11.float() + 1.0) * 0.5
-    gray = 0.299 * img01[:, 0:1] + 0.587 * img01[:, 1:2] + 0.114 * img01[:, 2:3]
-    sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], device=gray.device, dtype=gray.dtype)
-    sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], device=gray.device, dtype=gray.dtype)
-    lap = torch.tensor([[[[0, 1, 0], [1, -4, 1], [0, 1, 0]]]], device=gray.device, dtype=gray.dtype)
-    gx = F.conv2d(gray, sobel_x, padding=1)
-    gy = F.conv2d(gray, sobel_y, padding=1)
-    sobel_mag = torch.sqrt(gx * gx + gy * gy + 1e-6)
-    lap_abs = F.conv2d(gray, lap, padding=1).abs()
-    lowpass = F.avg_pool2d(gray, kernel_size=7, stride=1, padding=3)
-    return torch.cat([lowpass, gray, sobel_mag, lap_abs], dim=1).clamp(0.0, 1.0)
+def build_adapter_struct_input(lr_small_m11: torch.Tensor) -> torch.Tensor:
+    return lr_small_m11.float().clamp(-1.0, 1.0)
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None:
@@ -137,6 +126,22 @@ def apply_lora(model, rank=16, alpha=16):
     print(f"✅ LoRA applied to {cnt} layers.")
 
 
+
+
+def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context: str = "load"):
+    curr = model.state_dict()
+    filt = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in curr and tuple(v.shape) == tuple(curr[k].shape):
+            filt[k] = v
+        else:
+            skipped.append(k)
+    missing, unexpected = model.load_state_dict(filt, strict=False)
+    print(f"[{context}] compatible load: loaded={len(filt)}, skipped_shape_or_missing={len(skipped)}, missing={len(missing)}, unexpected={len(unexpected)}")
+    if len(skipped) > 0:
+        print(f"[{context}] skipped examples: {skipped[:5]}")
+    return missing, unexpected, skipped
 def _load_pixart_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
     saved = set(saved_trainable.keys())
     model_keys = set(pixart.state_dict().keys())
@@ -169,20 +174,20 @@ def run(args):
     transition_layers = list(inj_cfg.get("transition_layers", []))
     detail_layers = list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24]))
 
-    pixart = PixArtSigmaSRDualStream_XL_2(
+    pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
         sparse_inject_ratio=1.0,
-        injection_cutoff_layer=injection_cutoff_layer,
-        injection_strategy=injection_strategy,
-        hard_injection_layers=hard_layers,
-        transition_injection_layers=transition_layers,
-        detail_injection_layers=detail_layers,
-        injection_r_end=0.1,
-        injection_s_min=0.1,
-        injection_s_max=1.0,
-        injection_init_p=2.0,
+        
+        
+        
+        
+        
+        
+        
+        
+        
         dualstream_enabled=False,
         cross_attn_start_layer=16,
         dual_num_heads=16,
@@ -198,7 +203,7 @@ def run(args):
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
     else:
-        pixart.load_state_dict(base, strict=False)
+        load_state_dict_shape_compatible(pixart, base, context="infer-base-pretrain")
 
     adapter = build_adapter_v7(
         in_channels=4,
@@ -209,11 +214,19 @@ def run(args):
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
 
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
+    if "lora_rank" in ckpt:
+        ckpt_lora_rank = int(ckpt["lora_rank"])
+    else:
+        ckpt_lora_rank = int(args.lora_rank)
+    if "lora_alpha" in ckpt:
+        ckpt_lora_alpha = int(ckpt["lora_alpha"])
+    else:
+        ckpt_lora_alpha = int(args.lora_alpha)
     if has_lora:
-        apply_lora(pixart, rank=args.lora_rank, alpha=args.lora_alpha)
+        apply_lora(pixart, rank=ckpt_lora_rank, alpha=ckpt_lora_alpha)
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
-    adapter.load_state_dict(ckpt["adapter"], strict=True)
+    load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="infer-adapter")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -242,7 +255,13 @@ def run(args):
     lr_pil = lr_pil.resize((args.crop_size, args.crop_size), Image.BICUBIC)
     to_tensor = transforms.ToTensor()
     norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
-    lr = norm(to_tensor(lr_pil)).unsqueeze(0).to(device)
+    lr_in = norm(to_tensor(lr_pil)).unsqueeze(0).to(device)
+    if args.input_is_lr_small:
+        lr_small = lr_in
+        lr = F.interpolate(lr_small, size=(args.crop_size, args.crop_size), mode="bicubic", align_corners=False, antialias=True)
+    else:
+        lr = lr_in
+        lr_small = F.interpolate(lr, size=(args.crop_size // 4, args.crop_size // 4), mode="bicubic", align_corners=False, antialias=True)
 
     z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
     gen = torch.Generator(device=device)
@@ -257,12 +276,13 @@ def run(args):
         latents = randn_like_with_generator(z_lr.to(compute_dtype), gen)
         run_timesteps = scheduler.timesteps
 
-    adapter_in = build_adapter_struct_input(lr).to(dtype=torch.float32)
-    cond = adapter(adapter_in, sem_image=lr, return_style=False)
+    adapter_in = build_adapter_struct_input(lr_small).to(device=device, dtype=torch.float32)
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
+        t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
+        cond = adapter(adapter_in, t_embed=t_embed.float())
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
             drop_uncond = torch.ones(latents.shape[0], device=device)
             drop_cond = torch.ones(latents.shape[0], device=device)
@@ -276,8 +296,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                    injection_mode="hybrid",
-                    force_drop_ids=drop_cond,
+                                        force_drop_ids=drop_cond,
                 )
             else:
                 cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=device))
@@ -289,8 +308,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond_zero,
-                    injection_mode="hybrid",
-                    force_drop_ids=drop_uncond,
+                                        force_drop_ids=drop_uncond,
                 )
                 out_cond = pixart(
                     x=model_in,
@@ -300,8 +318,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                    injection_mode="hybrid",
-                    force_drop_ids=drop_cond,
+                                        force_drop_ids=drop_cond,
                 )
                 out = out_uncond + args.cfg_scale * (out_cond - out_uncond)
 
@@ -335,8 +352,9 @@ def parse_args():
     parser.set_defaults(use_lq_init=True)
     parser.add_argument("--lq-init-strength", type=float, default=0.3)
     parser.add_argument("--cfg-scale", type=float, default=1.0)
-    parser.add_argument("--lora-rank", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-rank", type=int, default=4)
+    parser.add_argument("--lora-alpha", type=int, default=4)
+    parser.add_argument("--input_is_lr_small", type=lambda x: str(x).lower() in ("1","true","yes","y"), default=True)
     return parser.parse_args()
 
 
