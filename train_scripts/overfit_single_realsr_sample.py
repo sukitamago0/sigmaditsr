@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
-from diffusion.model.gaussian_diffusion import GaussianDiffusion
+from diffusion import IDDPM
 
 
 # ============================== Interpretation Guide ==============================
@@ -475,6 +475,7 @@ def main():
     parser.add_argument("--vae_path", type=str, required=True)
     parser.add_argument("--null_t5_embed_path", type=str, required=True)
     parser.add_argument("--ckpt_path", type=str, default="")
+    parser.add_argument("--init_mode", type=str, default="warm", choices=["warm", "cold"])
     parser.add_argument("--realsr_roots", type=str, default="/data/RealSR/Nikon/Test/4,/data/RealSR/Canon/Test/4")
     parser.add_argument("--pick_index", type=int, default=0)
     parser.add_argument("--roi", type=str, default="")
@@ -527,7 +528,10 @@ def main():
 
     adapter = build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(device).float()
 
-    if args.ckpt_path and os.path.exists(args.ckpt_path):
+    print(f"[Overfit] init_mode={args.init_mode}")
+    if args.init_mode == "warm":
+        if not args.ckpt_path or (not os.path.exists(args.ckpt_path)):
+            raise FileNotFoundError("init_mode=warm requires a valid --ckpt_path")
         ckpt = torch.load(args.ckpt_path, map_location="cpu")
         saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
         has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
@@ -538,8 +542,11 @@ def main():
         _load_pixart_subset_compatible(pixart, saved_trainable, context="overfit")
         if "adapter" in ckpt:
             load_state_dict_shape_compatible(adapter, ckpt["adapter"], context="overfit-adapter")
+    elif args.init_mode == "cold":
+        # Cold-start: only pretrained PixArt base is loaded; do NOT load ckpt subset/adapter/LoRA.
+        pass
     else:
-        apply_lora_attn_only(pixart, rank=args.lora_rank, alpha=args.lora_alpha)
+        raise ValueError(f"Unknown init_mode={args.init_mode}")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -565,7 +572,7 @@ def main():
         adapter_lr=args.adapter_lr,
     )
 
-    diffusion = GaussianDiffusion(timestep_respacing="")
+    diffusion = IDDPM(str(1000))
     pixart.train()
     adapter.train()
 
